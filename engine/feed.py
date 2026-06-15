@@ -17,8 +17,8 @@ import pyarrow.parquet as pq
 
 from .snapshot import MarketSnapshot
 
-BID, ASK, IV = "bid_0", "ask_0", "iv"          # quote column suffixes in the data
-DEFAULT_FIELDS = (BID, ASK)
+BID, ASK       = "bid_0", "ask_0"
+DEFAULT_FIELDS = ('spot', 'atm_strike', 'ce_bid_0', 'ce_ask_0', 'pe_bid_0', 'pe_ask_0')
 
 def _parse_strike(token: str):
     """Return float(token) if it's a (possibly decimal) number, else None."""
@@ -27,46 +27,106 @@ def _parse_strike(token: str):
     except ValueError:
         return None
 
+def _split_fields(fields):
+    """Split fields into plain column names and (opt_type, suffix) pairs.
+    
+    'spot'       -> plain field
+    'atm_strike' -> plain field
+    'ce_bid_0'   -> opt field: ('ce', 'bid_0')
+    'pe_ask_0'   -> opt field: ('pe', 'ask_0')
+    """
+    plain, opt = [], []
+    for f in fields:
+        if f.startswith('ce_'):
+            opt.append(('ce', f[3:]))
+        elif f.startswith('pe_'):
+            opt.append(('pe', f[3:]))
+        else:
+            plain.append(f)
+    return plain, opt
+
+def _merge_fields(fields):
+    """Always include DEFAULT_FIELDS; user fields are additive on top."""
+    return tuple(dict.fromkeys((*DEFAULT_FIELDS, *fields)))
 
 class Feed:
     def __init__(self, df: pd.DataFrame, strikes: List[float], base=None, fields=DEFAULT_FIELDS, tokens=None):
+        fields = _merge_fields(fields)
         if tokens is None:                       # constructed directly from a df
             _, tokens = self._discover_strikes(list(df.columns))
         self.strike_tokens = tokens
-        self.strikes    = np.asarray(sorted(strikes), dtype=float)
+        self.strikes       = np.asarray(sorted(strikes), dtype=float)
         self.strike_to_col: Dict[float, int] = {float(k): i for i, k in enumerate(self.strikes)}
-        self.ts         = df['timestamp'].to_numpy(dtype=np.int64)
-        self.spot       = df['spot'].to_numpy(dtype=float)
-        self.atm_strike = df['atm_strike'].to_numpy(dtype=float)
-        
+        self.ts     = df['timestamp'].to_numpy(dtype=np.int64)
         self.fields = tuple(fields)
-        self.arrays = {}                              
-        for ot in ("ce", "pe"):
-            for f in self.fields:
-                self.arrays[(ot, f)] = self._stack(df, ot, f)
-        
-        self.ce_bid, self.ce_ask = self.arrays[("ce", BID)], self.arrays[("ce", ASK)]
-        self.pe_bid, self.pe_ask = self.arrays[("pe", BID)], self.arrays[("pe", ASK)]
+
+        plain_fields, opt_fields = _split_fields(self.fields)
+
+        self.arrays: Dict[object, np.ndarray] = {}
+        for f in plain_fields:
+            if f in df.columns:
+                self.arrays[f] = df[f].to_numpy(dtype=float)
+
+        for (ot, suf) in opt_fields:
+            self.arrays[(ot, suf)] = self._stack(df, ot, suf)
+
+        # shortcuts — None if the field wasn't requested
+        self.spot       = self.arrays.get('spot',       np.full(len(self.ts), np.nan))
+        self.atm_strike = self.arrays.get('atm_strike', np.full(len(self.ts), np.nan))
+        self.ce_bid     = self.arrays.get(('ce', BID))
+        self.ce_ask     = self.arrays.get(('ce', ASK))
+        self.pe_bid     = self.arrays.get(('pe', BID))
+        self.pe_ask     = self.arrays.get(('pe', ASK))
 
     # ---- construction ------------------------------------------------------
     @classmethod
     def from_parquet(cls, path: str, fields=DEFAULT_FIELDS) -> "Feed":
         columns = pq.ParquetFile(path).schema.names
         strikes, tokens = cls._discover_strikes(columns)
-        base = [col for col in ('spot', 'atm_strike') if col in columns]
-        wanted = set(base)
+        fields = _merge_fields(fields)
+        plain_fields, opt_fields = _split_fields(fields)
         
-        for strike in strikes:
-            tok = tokens[strike]                       # original token for this strike
-            for ot in ("ce", "pe"):
-                for suf in fields:
-                    col = f"{tok}_{ot}_{suf}"
-                    if col in columns:
-                        wanted.add(col)
+        wanted = set()
+        for f in plain_fields:
+            if f in columns:
+                wanted.add(f)
 
+        for strike in strikes:
+            tok = tokens[strike]
+            for (ot, suf) in opt_fields:
+                col = f"{tok}_{ot}_{suf}"
+                if col in columns:
+                    wanted.add(col)
         df = pd.read_parquet(path, columns=list(wanted))
         df = df.reset_index()
-        return cls(df, strikes, base, fields, tokens)
+        return cls(df, strikes, fields=fields, tokens=tokens)
+    
+    @classmethod
+    def from_csv(cls, path: str, fields=DEFAULT_FIELDS) -> "Feed":
+        columns = pd.read_csv(path, nrows=0).columns.tolist()
+        strikes, tokens = cls._discover_strikes(columns)
+        fields = _merge_fields(fields)
+        plain_fields, opt_fields = _split_fields(fields)
+        wanted = set()
+        for f in plain_fields:
+            if f in columns:
+                wanted.add(f)
+
+        for strike in strikes:
+            tok = tokens[strike]
+            for (ot, suf) in opt_fields:
+                col = f"{tok}_{ot}_{suf}"
+                if col in columns:
+                    wanted.add(col)
+
+        df = pd.read_csv(path, usecols=list(wanted))
+        return cls(df, strikes, fields=fields, tokens=tokens)
+
+    @classmethod
+    def from_file(cls, path: str, fields=DEFAULT_FIELDS) -> "Feed":
+        if path.endswith('.csv'):
+            return cls.from_csv(path, fields)
+        return cls.from_parquet(path, fields)
 
     @staticmethod
     def _discover_strikes(columns: List[str]) -> List[float]:

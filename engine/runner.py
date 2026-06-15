@@ -47,7 +47,7 @@ def _run_one_day(args):
     """Run one day in a fresh process. Pure: path + config in, results out."""
     (path, strategy_cls, strategy_kwargs, fields, lot_size, starting_cash, cost_kwargs, curve_every) = args
 
-    feed  = Feed.from_parquet(path, fields=fields)
+    feed  = Feed.from_file(path, fields=fields)
     pf    = Portfolio(lot_size=lot_size, starting_cash=starting_cash)
     cm    = CostModel(lot_size=lot_size, **cost_kwargs)
     led   = Tradelog()
