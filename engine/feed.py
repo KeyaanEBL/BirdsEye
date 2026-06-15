@@ -1,154 +1,131 @@
 """
-feed.py — turn a day's parquet into a stream of array-backed MarketSnapshots.
+feed.py — turn a day's feed file into a stream of array-backed MarketSnapshots.
 
-- Loads ONLY the needed columns from the parquet (timestamp, spot, atm_strike,
-  and per-strike CE/PE bid_0/ask_0), never the whole file.
-- Discovers strikes from the `{strike}_{opt_type}_premium` column names
-  (decimal-safe), then stacks bid/ask into shared (n_rows, n_strikes) arrays
-  once. Per-second iteration just hands out row views — no per-row dicts.
-- Assumes bid_0 / ask_0 are present (no synthesis).
+PRIMARY path (raw /mnt, my preprocessing): `Feed.from_raw(path, index, fields)`
+reads the raw source the SAME way markouts_custom_instruments.ipynb does —
+through Intern-Project's `data.load_columns`, which preprocesses on the fly
+(session filter, 0->NaN/ffill cleaning, decimal-strike normalisation) and returns
+standardised columns: plain (`spot`, `atm_strike`) and strike-wildcard dicts
+(`*_ce_bid_0`, `*_pe_ask_0`, …) keyed by integer strike. No preprocessed parquet
+directory is assumed; the manifest only assigns dates to splits.
+
+FIELD MODEL: a `fields` entry is either a PLAIN column
+('spot', 'atm_strike') or an OPTION field ('ce_bid_0', 'pe_ask_0' -> (opt, suf)).
+`_merge_fields` always folds in DEFAULT_FIELDS, so spot/atm_strike + ce/pe bid/ask
+are present regardless of what the caller asks for; extra fields are additive.
+
+All per-strike fields are stacked into shared (n_rows, n_strikes) numpy arrays
+once, so per-second iteration just hands out row views — no per-row dicts.
+Arrays are keyed by the plain name (1-D) or by (opt_type, suffix) (2-D).
 """
 
-
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator
 import numpy as np
-import pandas as pd
-import pyarrow.parquet as pq
 
 from .snapshot import MarketSnapshot
+from .env import load_columns, get_column_map
 
-BID, ASK       = "bid_0", "ask_0"
-DEFAULT_FIELDS = ('spot', 'atm_strike', 'ce_bid_0', 'ce_ask_0', 'pe_bid_0', 'pe_ask_0')
+BID, ASK = "bid_0", "ask_0"
+DEFAULT_FIELDS = ("spot", "atm_strike", "ce_bid_0", "ce_ask_0", "pe_bid_0", "pe_ask_0")
 
-def _parse_strike(token: str):
-    """Return float(token) if it's a (possibly decimal) number, else None."""
-    try:
-        return float(token)
-    except ValueError:
-        return None
 
 def _split_fields(fields):
-    """Split fields into plain column names and (opt_type, suffix) pairs.
-    
-    'spot'       -> plain field
-    'atm_strike' -> plain field
-    'ce_bid_0'   -> opt field: ('ce', 'bid_0')
-    'pe_ask_0'   -> opt field: ('pe', 'ask_0')
-    """
+    """Split `fields` into plain column names and (opt_type, suffix) pairs.
+        'spot' / 'atm_strike' -> plain   ;   'ce_bid_0' -> ('ce','bid_0')."""
     plain, opt = [], []
     for f in fields:
-        if f.startswith('ce_'):
-            opt.append(('ce', f[3:]))
-        elif f.startswith('pe_'):
-            opt.append(('pe', f[3:]))
+        if f.startswith("ce_"):
+            opt.append(("ce", f[3:]))
+        elif f.startswith("pe_"):
+            opt.append(("pe", f[3:]))
         else:
             plain.append(f)
     return plain, opt
 
+
 def _merge_fields(fields):
-    """Always include DEFAULT_FIELDS; user fields are additive on top."""
+    """Always include DEFAULT_FIELDS; user fields are additive on top (order-stable)."""
     return tuple(dict.fromkeys((*DEFAULT_FIELDS, *fields)))
 
+
 class Feed:
-    def __init__(self, df: pd.DataFrame, strikes: List[float], base=None, fields=DEFAULT_FIELDS, tokens=None):
-        fields = _merge_fields(fields)
-        if tokens is None:                       # constructed directly from a df
-            _, tokens = self._discover_strikes(list(df.columns))
-        self.strike_tokens = tokens
-        self.strikes       = np.asarray(sorted(strikes), dtype=float)
+    """Array-backed view of one day. Build it from a raw /mnt file with
+    `Feed.from_raw(path, index, fields)`, or directly from preassembled arrays
+    with `from_arrays` (tests)."""
+
+    def __init__(self, ts, strikes, arrays: Dict[object, np.ndarray], fields):
+        self.ts      = np.asarray(ts, dtype=np.int64)
+        self.strikes = np.asarray(sorted(strikes), dtype=float)
         self.strike_to_col: Dict[float, int] = {float(k): i for i, k in enumerate(self.strikes)}
-        self.ts     = df['timestamp'].to_numpy(dtype=np.int64)
-        self.fields = tuple(fields)
+        self.fields  = tuple(fields)
+        self.arrays  = arrays            # plain name -> (n,) ; (opt, suffix) -> (n, n_strikes)
 
-        plain_fields, opt_fields = _split_fields(self.fields)
+        n = len(self.ts)
+        # plain shortcuts (NaN-filled if the field wasn't loaded)
+        self.spot       = arrays.get("spot",       np.full(n, np.nan))
+        self.atm_strike = arrays.get("atm_strike", np.full(n, np.nan))
+        # quote shortcuts (None if not requested)
+        self.ce_bid, self.ce_ask = arrays.get(("ce", BID)), arrays.get(("ce", ASK))
+        self.pe_bid, self.pe_ask = arrays.get(("pe", BID)), arrays.get(("pe", ASK))
 
-        self.arrays: Dict[object, np.ndarray] = {}
-        for f in plain_fields:
-            if f in df.columns:
-                self.arrays[f] = df[f].to_numpy(dtype=float)
-
-        for (ot, suf) in opt_fields:
-            self.arrays[(ot, suf)] = self._stack(df, ot, suf)
-
-        # shortcuts — None if the field wasn't requested
-        self.spot       = self.arrays.get('spot',       np.full(len(self.ts), np.nan))
-        self.atm_strike = self.arrays.get('atm_strike', np.full(len(self.ts), np.nan))
-        self.ce_bid     = self.arrays.get(('ce', BID))
-        self.ce_ask     = self.arrays.get(('ce', ASK))
-        self.pe_bid     = self.arrays.get(('pe', BID))
-        self.pe_ask     = self.arrays.get(('pe', ASK))
-
-    # ---- construction ------------------------------------------------------
+    # ---- construction: raw /mnt via the Intern-Project pipeline (primary) ---
     @classmethod
-    def from_parquet(cls, path: str, fields=DEFAULT_FIELDS) -> "Feed":
-        columns = pq.ParquetFile(path).schema.names
-        strikes, tokens = cls._discover_strikes(columns)
-        fields = _merge_fields(fields)
-        plain_fields, opt_fields = _split_fields(fields)
-        
-        wanted = set()
-        for f in plain_fields:
-            if f in columns:
-                wanted.add(f)
+    def from_raw(cls, path: str, index: str, fields=DEFAULT_FIELDS) -> "Feed":
+        """Load+preprocess a raw /mnt day for `index` (e.g. 'SPY') via
+        `data.load_columns`. Plain fields come back as 1-D arrays; option fields
+        as strike-wildcard dicts that get stacked into (n, n_strikes) arrays.
+        Raises ValueError on a day with no usable bars (caller skips it)."""
+        fields     = _merge_fields(fields)
+        plain, opt = _split_fields(fields)
+        cmap       = get_column_map(index)
 
-        for strike in strikes:
-            tok = tokens[strike]
-            for (ot, suf) in opt_fields:
-                col = f"{tok}_{ot}_{suf}"
-                if col in columns:
-                    wanted.add(col)
-        df = pd.read_parquet(path, columns=list(wanted))
-        df = df.reset_index()
-        return cls(df, strikes, fields=fields, tokens=tokens)
-    
-    @classmethod
-    def from_csv(cls, path: str, fields=DEFAULT_FIELDS) -> "Feed":
-        columns = pd.read_csv(path, nrows=0).columns.tolist()
-        strikes, tokens = cls._discover_strikes(columns)
-        fields = _merge_fields(fields)
-        plain_fields, opt_fields = _split_fields(fields)
-        wanted = set()
-        for f in plain_fields:
-            if f in columns:
-                wanted.add(f)
+        # only request plain fields the column map can actually resolve (so a
+        # stale bare 'bid_0'/'ask_0' from older callers is silently dropped — the
+        # option defaults below still provide ce/pe bid/ask).
+        plain = [f for f in plain if _resolvable(cmap, f)]
+        wild  = [f"*_{ot}_{suf}" for (ot, suf) in opt]
+        cols  = load_columns(path, [*plain, *wild], cmap, index)
 
-        for strike in strikes:
-            tok = tokens[strike]
-            for (ot, suf) in opt_fields:
-                col = f"{tok}_{ot}_{suf}"
-                if col in columns:
-                    wanted.add(col)
+        arrays: Dict[object, np.ndarray] = {}
+        n = None
+        for f in plain:
+            arrays[f] = np.asarray(cols[f], dtype=float)
+            n = len(arrays[f])
 
-        df = pd.read_csv(path, usecols=list(wanted))
-        return cls(df, strikes, fields=fields, tokens=tokens)
+        # strike universe = union of strikes quoted in any requested option field
+        strike_set = set()
+        for (ot, suf) in opt:
+            strike_set |= set(cols[f"*_{ot}_{suf}"].keys())
+        strikes = sorted(float(s) for s in strike_set)
+        col_of  = {float(k): i for i, k in enumerate(strikes)}
+
+        if n is None:                                  # no plain field -> infer n from an option dict
+            n = 0
+            for (ot, suf) in opt:
+                d = cols[f"*_{ot}_{suf}"]
+                if d:
+                    n = len(next(iter(d.values())))
+                    break
+
+        for (ot, suf) in opt:
+            arr = np.full((n, len(strikes)), np.nan)
+            for s, series in cols[f"*_{ot}_{suf}"].items():
+                arr[:, col_of[float(s)]] = series
+            arrays[(ot, suf)] = arr
+
+        # bar index is seconds-from-open after the session filter — what the
+        # strategy uses as "now". Real epoch timestamps aren't needed downstream.
+        ts = np.arange(n, dtype=np.int64)
+        return cls(ts, strikes, arrays, fields)
 
     @classmethod
-    def from_file(cls, path: str, fields=DEFAULT_FIELDS) -> "Feed":
-        if path.endswith('.csv'):
-            return cls.from_csv(path, fields)
-        return cls.from_parquet(path, fields)
-
-    @staticmethod
-    def _discover_strikes(columns: List[str]) -> List[float]:
-        tokens = {}                          # float strike -> original token, e.g. 471.0 -> "471.00"
-        for c in columns:
-            if c.endswith("_premium"):
-                tok = c.split("_")[0]
-                k = _parse_strike(tok)
-                if k is not None:
-                    tokens[k] = tok
-        return sorted(tokens), tokens
-
-    def _stack(self, df, opt_type, field):
-        n = len(df)
-        arr = np.full((n, len(self.strikes)), np.nan)
-        cols = set(df.columns)
-        for i, k in enumerate(self.strikes):
-            tok = self.strike_tokens[k]
-            col = f"{tok}_{opt_type}_{field}"
-            if col in cols:
-                arr[:, i] = df[col].to_numpy(dtype=float)
-        return arr
+    def from_arrays(cls, ts, spot, atm_strike, strikes, arrays, fields=DEFAULT_FIELDS) -> "Feed":
+        """Build a Feed from preassembled arrays (tests / synthetic days). `spot`
+        and `atm_strike` are folded into the arrays dict if not already there."""
+        a = dict(arrays)
+        a.setdefault("spot", spot)
+        a.setdefault("atm_strike", atm_strike)
+        return cls(ts, strikes, a, fields)
 
     # ---- iteration ---------------------------------------------------------
     def __len__(self) -> int:
@@ -156,4 +133,14 @@ class Feed:
 
     def __iter__(self) -> Iterator[MarketSnapshot]:
         for i in range(len(self.ts)):
-            yield MarketSnapshot(ts = int(self.ts[i]), spot = float(self.spot[i]), _i = i, _feed = self)
+            yield MarketSnapshot(ts=int(self.ts[i]), spot=float(self.spot[i]), _i=i, _feed=self)
+
+
+def _resolvable(cmap, field) -> bool:
+    """True if the column map can resolve a plain abstract field name (e.g. 'spot',
+    'atm_strike'); False for stray suffixes like a bare 'bid_0'."""
+    try:
+        cmap[field]
+        return True
+    except KeyError:
+        return False

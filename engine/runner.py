@@ -40,21 +40,30 @@ from .costs import CostModel
 from .ledger import Tradelog, PerSecLog
 from .portfolio import Portfolio
 from .broker import Broker
+from .env import env, get_manifest_files, get_data_dir
+from .logsetup import make_logger
 from . import analyzers, plots
 
 
 def _run_one_day(args):
-    """Run one day in a fresh process. Pure: path + config in, results out."""
-    (path, strategy_cls, strategy_kwargs, fields, lot_size, starting_cash, cost_kwargs, curve_every) = args
+    """Run one day in a fresh process. Pure: raw path + index + config in,
+    results out. A day with no usable bars (load error) returns a skip sentinel
+    (curve=None, last field = the error) instead of aborting the whole run."""
+    (path, index, strategy_cls, strategy_kwargs, fields,
+     lot_size, starting_cash, cost_kwargs, curve_every) = args
 
-    feed  = Feed.from_file(path, fields=fields)
+    day = os.path.basename(path).split(".")[0]
+    try:
+        feed = Feed.from_raw(path, index, fields=fields)     # raw /mnt -> arrays
+    except Exception as e:
+        return day, None, None, None, None, f"load error: {e}"
+
     pf    = Portfolio(lot_size=lot_size, starting_cash=starting_cash)
     cm    = CostModel(lot_size=lot_size, **cost_kwargs)
     led   = Tradelog()
     br    = Broker(pf, cm, led)
     strat = strategy_cls(broker=br, **strategy_kwargs)
 
-    day = os.path.basename(path).split(".")[0]
     try:
         for snap in feed:
             strat.next(snap)
@@ -66,9 +75,8 @@ def _run_one_day(args):
     if curve_every > 1:               # optional downsample (always keep last point)
         curve = curve[::curve_every] + ([curve[-1]] if (len(curve) - 1) % curve_every else [])
 
-    day = os.path.basename(path).split(".")[0]
     perseclog = strat.perseclog.as_dataframe()
-    return day, curve, led, pf.equity_curve[-1][1] - starting_cash, perseclog
+    return day, curve, led, pf.equity_curve[-1][1] - starting_cash, perseclog, None
 
 
 class Results:
@@ -162,18 +170,26 @@ class Results:
 
 class BirdsEye:
     def __init__(self,
-                 data_dir        : str,
                  strategy_cls    : Type,
+                 index           : str = "SPY",                        # picks column map + raw data_dir
+                 manifest_path   : Optional[str] = None,               # split source (e.g. manifest_tvt.json)
+                 split           : str = "train",                      # which manifest split to run
+                 mode            : str = "0-dte",                      # manifest mode key
+                 data_dir        : Optional[str] = None,               # raw /mnt dir; default = config.get_data_dir(index)
                  strategy_kwargs : Optional[dict] = None,
-                 fields          : Tuple[str, ...] = DEFAULT_FIELDS,   # -> Feed
+                 fields          : Tuple[str, ...] = DEFAULT_FIELDS,   # -> Feed (per-strike fields)
                  lot_size        : float = 1.0,                        # -> Portfolio + CostModel
                  starting_cash   : float = 0.0,                        # -> Portfolio (fresh per day)
                  cost_kwargs     : Optional[dict] = None,              # -> CostModel
                  n_workers       : Optional[int] = None,               # -> ProcessPoolExecutor
                  days            : Optional[List[str]] = None,         # subset, e.g. ["20240208"]
                  curve_every     : int = 1):                           # equity downsample factor
-        self.data_dir        = data_dir
         self.strategy_cls    = strategy_cls
+        self.index           = index
+        self.manifest_path   = manifest_path
+        self.split           = split
+        self.mode            = mode
+        self.data_dir        = data_dir
         self.strategy_kwargs = strategy_kwargs or {}
         self.fields          = tuple(fields)
         self.lot_size        = lot_size
@@ -184,17 +200,37 @@ class BirdsEye:
         self.curve_every     = max(1, curve_every)
 
     def _paths(self) -> List[str]:
-        paths = sorted(glob.glob(os.path.join(self.data_dir, "*.parquet")))
+        """Raw /mnt source paths for the run. From the manifest split when a
+        manifest is available (constructor arg, else .env MANIFEST_PATH), else
+        every raw file in the index's data_dir. `days` further subsets either way.
+        Paths default to .env (MANIFEST_PATH / DATA_DIR) — nothing hardcoded here."""
+        manifest = self.manifest_path or env("MANIFEST_PATH")
+        data_dir = self.data_dir or env("DATA_DIR")
+        if manifest:
+            recs  = get_manifest_files(self.index, self.split, self.mode,
+                                       manifest, data_dir)
+            paths = [r["path"] for r in recs]
+        else:
+            ddir  = data_dir or get_data_dir(self.index)
+            paths = sorted(glob.glob(os.path.join(ddir, "*.parquet"))
+                           + glob.glob(os.path.join(ddir, "*.csv")))
         if self.days:
             keep  = set(self.days)
             paths = [p for p in paths if os.path.basename(p).split(".")[0] in keep]
         if not paths:
-            raise FileNotFoundError(f"no parquet days found in {self.data_dir}")
+            raise FileNotFoundError(
+                f"no raw {self.index} days found "
+                f"({'manifest ' + self.manifest_path if self.manifest_path else self.data_dir})")
         return paths
 
     def run(self, parallel: bool = True) -> Results:
+        log   = make_logger(f"{self.index}_{self.split}")
         paths = self._paths()
-        jobs  = [(p, self.strategy_cls, self.strategy_kwargs, self.fields, self.lot_size, self.starting_cash, self.cost_kwargs, self.curve_every) for p in paths]
+        log.info("run start | index=%s split=%s strategy=%s | %d day(s)",
+                 self.index, self.split, self.strategy_cls.__name__, len(paths))
+        jobs  = [(p, self.index, self.strategy_cls, self.strategy_kwargs, self.fields,
+                  self.lot_size, self.starting_cash, self.cost_kwargs, self.curve_every)
+                 for p in paths]
 
         n = min(self.n_workers or (os.cpu_count() or 1), len(paths))
         if parallel and n > 1:
@@ -203,9 +239,28 @@ class BirdsEye:
         else:
             outs = [_run_one_day(j) for j in jobs]
 
-        days      = [o[0] for o in outs]
-        curves    = {o[0]: o[1] for o in outs}
-        Tradelogs = {o[0]: o[2] for o in outs}
-        pnls      = [o[3] for o in outs]
-        perseclogs = {o[0]: o[4] for o in outs}
-        return Results(days, curves, Tradelogs, pnls, self.starting_cash, self.lot_size, perseclogs)
+        good    = [o for o in outs if o[1] is not None]      # curve is None on a load error
+        skipped = [(o[0], o[5]) for o in outs if o[1] is None]
+        if skipped:
+            log.info("%d day(s) skipped: %s", len(skipped),
+                     "; ".join(f"{d} ({m})" for d, m in skipped))
+
+        days       = [o[0] for o in good]
+        curves     = {o[0]: o[1] for o in good}
+        Tradelogs  = {o[0]: o[2] for o in good}
+        pnls       = [o[3] for o in good]
+        perseclogs = {o[0]: o[4] for o in good}
+        res = Results(days, curves, Tradelogs, pnls, self.starting_cash, self.lot_size, perseclogs)
+        res.log_path = log.log_path                          # where this run was logged
+
+        # log what the Results object produces, instead of printing it
+        if days:
+            log.info("per-day summary:\n%s", res.summary.to_string())
+            log.info("aggregate stats:\n%s",
+                     "\n".join(f"  {k:<16}: {v}" for k, v in res.stats().items()))
+        else:
+            log.info("no successful days")
+        for h in log.handlers:
+            h.flush()
+        print(f"[birdseye] log -> {log.log_path}")          # one-line pointer, not the logs themselves
+        return res
