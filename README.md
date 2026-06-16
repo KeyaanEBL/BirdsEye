@@ -214,9 +214,8 @@ res = be.run()          # one process per day, chronological order preserved
 ```python
 res.summary                 # per-day table: fills / gross / costs / net
 res.stats()                 # CAGR, Calmar, churn, win rate, drawdowns, costs … (2dp)
-res.tearsheet()             # daily PnL + stitched equity + drawdown figure
-res.plot_day("20240208")    # one day's intraday MtM with buy/sell markers
-res.Tradelog()              # every fill, every day, one DataFrame
+plot_equity("20240208")     # PnL across the days
+res.tradelog                # every fill, every day, one DataFrame
 res.perseclog("20240208")   # the per-second flight recorder for one day
 ```
 
