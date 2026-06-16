@@ -197,7 +197,7 @@ class Results:
             "maxDD_net"     : dd_n,
             "calmar_net"    : calmar_n,
             "n_fills"       : len(tl) if not tl.empty else 0,
-            "churn"         : analyzers.churn(total_lots),
+            "churn"         : analyzers.churn(total_lots, self._max_lots),
             "total_costs"   : total_costs,
         })
         return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in out.items()}
