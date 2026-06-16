@@ -26,16 +26,20 @@ Quote = Optional[Tuple[float, float, float]]   # (bid, ask, mid)
 
 @dataclass
 class OrderLeg:
-    strike   : float
-    opt_type : str            # "CE" or "PE"
-    lots     : float = 1.0    
-    action   : str   = "BUY"
+    strike     : float
+    opt_type   : str            # "CE" or "PE"
+    lots       : float = 1.0    
+    action     : str   = "BUY"
+    slice_lots : float = 1.0    # lots to release per tick
+    pause      : int   = 0      # ticks to wait between slices
 
     def __post_init__(self):
         self.opt_type = self.opt_type.upper()
         self.action   = self.action.upper()
         
-        assert self.lots > 0, f"lots must be positive (got {self.lots})"
+        assert self.lots > 0,       f"lots must be positive (got {self.lots})"
+        assert self.slice_lots > 0, f"slice_lots must be positive (got {self.slice_lots})"
+        assert self.pause >= 0,     f"pause must be >= 0 (got {self.pause})"
         assert self.action in ("BUY", "SELL")
 
     @property

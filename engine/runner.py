@@ -1,35 +1,32 @@
 """
-runner.py — the consolidated BirdsEye entry point.
+runner.py — BirdsEye entry point.
 
-Give it a strategy class + the parameters for every layer, and it runs the whole
-backtest in parallel over days, returning a Results object that computes stats
-and plots on demand.
-
-    from engine import BirdsEye
+Parallelises a backtest over days, returns a Results object.
 
     be = BirdsEye(
-        data_dir   = "/home/keyaan/Project/data/SPY/0-dte/train",
-        strategy_cls = RangeShortStraddle,
-        strategy_kwargs = {},                      # -> strategy __init__ (besides broker)
-        fields     = ("bid_0", "ask_0"),           # -> Feed (per-strike fields to load)
-        lot_size   = 100,                          # -> Portfolio + CostModel
-        starting_cash = 1000.0,                    # -> Portfolio (fresh per day)
-        cost_kwargs = {"txn_cost_per_trade": 0.85},# -> CostModel (any of its params)
-        n_workers  = 36,                           # -> ProcessPoolExecutor
+        data_dir        = ".../SPY/0-dte/train",
+        strategy_cls    = RangeShortStrangle,
+        index           = "SPY",                      # sets periods_per_year
+        strategy_kwargs = {"lots": 10},
+        lot_size        = 100,
+        starting_cash   = 1_000_000.0,
+        margin_per_lot  = 150.0,
+        cost_kwargs     = {"txn_cost_per_lot": 0.85},
+        n_workers       = 40,
+        collect_perseclog = True,
     )
-    res = be.run()          # parallel over all days, chronological order kept
-    res.summary            # per-day dataframe (gross / costs / net / fills)
-    res.stats()            # aggregate dict (daily stats, calmar, drawdowns, costs)
-    res.tearsheet()        # daily PnL + stitched equity + drawdown figure
-    res.Tradelog()           # all fills across days, one dataframe
-
-NOTE on multiprocessing: workers fork on Linux, so notebook-defined strategy
-classes work as-is. If you ever run on a spawn platform (macOS/Windows), move
-the strategy class into an importable .py module.
+    res = be.run()
+    res.summary          # cached DataFrame
+    res.tradelog         # cached DataFrame
+    res.stats()
+    res.perseclog(day)   # per-second log, one day
 """
+
 import os
 import glob
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
+from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Type
 
 import numpy as np
@@ -37,151 +34,200 @@ import pandas as pd
 
 from .feed import Feed, DEFAULT_FIELDS
 from .costs import CostModel
-from .ledger import Tradelog, PerSecLog
+from .ledger import Tradelog
 from .portfolio import Portfolio
 from .broker import Broker
-from . import analyzers, plots
+from . import analyzers
 
+# periods per year by underlying — override with periods_per_year kwarg if needed
+PERIODS_PER_YEAR: Dict[str, int] = {
+    "SPY": 252, "QQQ": 252, "IWM": 252, "SPX": 252,
+    "NIFTY": 52, "BANKNIFTY": 52, "SENSEX": 52,
+}
+
+
+@dataclass
+class RunConfig:
+    """Single source of truth for run-level parameters shared by BirdsEye and Results."""
+    lot_size        : float
+    starting_cash   : float
+    margin_per_lot  : float
+    periods_per_year: int
+
+
+# ---------------------------------------------------------------------------
+# worker (one day, one process)
+# ---------------------------------------------------------------------------
 
 def _run_one_day(args):
-    """Run one day in a fresh process. Pure: path + config in, results out."""
-    (path, strategy_cls, strategy_kwargs, fields, lot_size, starting_cash, cost_kwargs, curve_every) = args
+    (path, strategy_cls, strategy_kwargs, fields,
+     cfg, cost_kwargs, curve_every, collect_perseclog) = args
 
     feed  = Feed.from_file(path, fields=fields)
-    pf    = Portfolio(lot_size=lot_size, starting_cash=starting_cash)
-    cm    = CostModel(lot_size=lot_size, **cost_kwargs)
+    pf    = Portfolio(lot_size=cfg.lot_size, starting_cash=cfg.starting_cash)
+    cm    = CostModel(lot_size=cfg.lot_size, **cost_kwargs)
     led   = Tradelog()
     br    = Broker(pf, cm, led)
     strat = strategy_cls(broker=br, **strategy_kwargs)
 
     day = os.path.basename(path).split(".")[0]
+    last_snap = None
     try:
         for snap in feed:
             strat.next(snap)
             br.mark_to_market(snap)
+            last_snap = snap
     except Exception as e:
         raise RuntimeError(f"[{day}] {e}") from e
 
-    curve = pf.equity_curve
-    if curve_every > 1:               # optional downsample (always keep last point)
-        curve = curve[::curve_every] + ([curve[-1]] if (len(curve) - 1) % curve_every else [])
+    if last_snap is not None:
+        br.eod_square_off(last_snap)
+        br.mark_to_market(last_snap)
 
-    day = os.path.basename(path).split(".")[0]
-    perseclog = strat.perseclog.as_dataframe()
-    return day, curve, led, pf.equity_curve[-1][1] - starting_cash, perseclog
+    raw_curve = np.array([e for _, e in pf.equity_curve], dtype=np.float64)
+    if curve_every > 1:
+        idx = list(range(0, len(raw_curve), curve_every))
+        if idx[-1] != len(raw_curve) - 1:
+            idx.append(len(raw_curve) - 1)
+        raw_curve = raw_curve[idx]
 
+    perseclog_data = None
+    if collect_perseclog:
+        df = strat.perseclog.as_dataframe()
+        perseclog_data = {col: df[col].to_numpy() for col in df.columns}
+
+    return (
+        day,
+        raw_curve,
+        led,
+        float(raw_curve[-1] - cfg.starting_cash),
+        perseclog_data,
+        sum(abs(f.lots) for f in led.fills),   # total traded lots (raw, not /2)
+        getattr(strat, "max_lots", 1.0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
 
 class Results:
-    def __init__(self, days, curves, Tradelogs, day_pnls, starting_cash, lot_size, perseclogs=None):
-        self.days          = days                      # chronological day keys
-        self.curves        = curves                    # day -> [(ts, equity)]
-        self.Tradelogs     = Tradelogs                 # day -> Tradelog
-        self.day_pnls      = day_pnls                  # chronological net PnL per day
-        self.starting_cash = starting_cash
-        self.perseclogs    = perseclogs or {}
-        self.lot_size      = lot_size
+    def __init__(self, days, curves, tradelogs, day_pnls, cfg: RunConfig,
+                 perseclogs=None, traded_lots_list=None, max_lots=None):
+        self.days         = days
+        self.curves       = curves
+        self.tradelogs    = tradelogs
+        self.day_pnls     = day_pnls
+        self.cfg          = cfg
+        self._perseclogs  = perseclogs or {}
+        self._traded_lots = traded_lots_list or []
+        self._max_lots    = max_lots or 1.0
 
-    # --- tables ---
-    @property
-    def summary(self) -> pd.DataFrame:
-        rows = []
-        for day, pnl in zip(self.days, self.day_pnls):
-            led   = self.Tradelogs[day]
-            costs = led.total_costs
-            rows.append({"day": day, "fills": len(led.fills), "gross($)": pnl + costs, "costs($)": costs, "net($)": pnl})
-        return pd.DataFrame(rows).set_index("day").round(2)
+    # --- tables (cached — concat is expensive over many days) ---------------
 
-    def Tradelog(self) -> pd.DataFrame:
+    @cached_property
+    def tradelog(self) -> pd.DataFrame:
         frames = []
         for day in self.days:
-            df = self.Tradelogs[day].as_dataframe()
+            df = self.tradelogs[day].as_dataframe()
             if not df.empty:
                 df.insert(0, "day", day)
                 frames.append(df)
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    
+
+    @cached_property
+    def summary(self) -> pd.DataFrame:
+        rows = []
+        for day, pnl in zip(self.days, self.day_pnls):
+            led   = self.tradelogs[day]
+            costs = led.total_costs
+            rows.append({
+                "day":      day,
+                "fills":    len(led.fills),
+                "gross($)": round(pnl + costs, 2),
+                "costs($)": round(costs, 2),
+                "net($)":   round(pnl, 2),
+            })
+        return pd.DataFrame(rows).set_index("day")
+
+    @cached_property
+    def all_curve(self) -> np.ndarray:
+        return np.concatenate(list(self.curves.values()))
+
     def perseclog(self, day: str) -> pd.DataFrame:
-        """Per-second log for one day: ts, i, spot, atm, state, every alpha."""
-        return self.perseclogs[day]
+        data = self._perseclogs.get(day)
+        if data is None:
+            raise ValueError(f"No perseclog for {day}. Re-run with collect_perseclog=True.")
+        return pd.DataFrame(data)
 
-    # --- stats ---
-    def stats(self) -> Dict[str, float]:
-        cap                   = self.starting_cash
-        out                   = dict(analyzers.daily_stats(self.day_pnls))
-        out["cagr"]           = analyzers.cagr(self.day_pnls, cap)
-        out["calmar"]         = analyzers.calmar(self.day_pnls, cap)
-        out["maxDD_pct"]      = analyzers.max_drawdown_pct(self.day_pnls, cap)
-        notional = sum(led.total_notional(self.lot_size) for led in self.Tradelogs.values())
-        out["churn_per_day"]  = analyzers.churn(notional, cap, len(self.days))
-        out["daily_maxDD"]    = analyzers.max_drawdown(list(enumerate(np.cumsum(self.day_pnls))))
-        out["intraday_maxDD"] = analyzers.max_drawdown(self.all_curve)
-        
-        led_all = self.Tradelog()
-        if not led_all.empty:
-            out["total_costs"] = float(led_all["exe_cost"].sum())
-            out["n_fills"]     = int(len(led_all))
-        return {k: (round(v, 2) if isinstance(v, float) else v) for k, v in out.items()}
+    # --- stats --------------------------------------------------------------
 
-    @property
-    def all_curve(self) -> List[Tuple[int, float]]:
-        """Per-second equity stitched across days (each day starts fresh)."""
-        curve = []
-        for day in self.days:
-            curve += self.curves[day]
-        return curve
+    def stats(self) -> Dict:
+        tl          = self.tradelog
+        total_costs = float(tl["exe_cost"].sum()) if not tl.empty else 0.0
+        total_lots  = np.mean(self._traded_lots)
+        cfg         = self.cfg
 
-    def tearsheet(self):
-        import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(3, 1, figsize=(11, 9))
-        plots.plot_daily_pnl(self.day_pnls, ax=ax[0])
-        ax[0].set_xticks(range(len(self.days)))
-        ax[0].set_xticklabels(self.days, rotation=45)
-        plots.plot_equity(self.all_curve, ax=ax[1])
-        plots.plot_drawdown(self.all_curve, ax=ax[2])
-        fig.tight_layout()
-        return fig
+        cagr_g, cagr_n     = analyzers.cagr(
+            self.day_pnls, total_costs,
+            cfg.margin_per_lot, self._max_lots, cfg.periods_per_year,
+        )
+        calmar_g, calmar_n = analyzers.calmar(
+            self.day_pnls, total_costs,
+            cfg.margin_per_lot, self._max_lots, cfg.periods_per_year,
+        )
 
-    def plot_day(self, day: str):
-        """Single-day equity with fill markers (entries v, exits ^ by lots sign)."""
-        import matplotlib.pyplot as plt
-        curve   = self.curves[day]
-        eq      = np.array([e for _, e in curve]); t = np.arange(len(eq))
-        df      = self.Tradelogs[day].as_dataframe()
-        fig, ax = plt.subplots(figsize=(12, 4))
-        ax.plot(t, eq, lw=1, color="0.3", label="equity (MtM @ mid)")
-        if not df.empty:
-            t0          = curve[0][0]
-            sec         = ((df["timestamp"] - t0) // 1_000_000_000).astype(int).clip(0, len(eq) - 1)
-            sells, buys = df["lots"] < 0, df["lots"] > 0
-            ax.scatter(sec[sells], eq[sec[sells]], marker="v", color="tab:red",   s=40, zorder=3, label="sell")
-            ax.scatter(sec[buys],  eq[sec[buys]],  marker="^", color="tab:green", s=40, zorder=3, label="buy")
-        ax.set_title(f"{day} — intraday equity"); ax.set_xlabel("seconds"); ax.set_ylabel("equity ($)")
-        ax.legend()
-        return fig
+        out = dict(analyzers.daily_stats(self.day_pnls))
+        out.update({
+            "cagr_gross"   : cagr_g,
+            "cagr_net"     : cagr_n,
+            "maxDD_pct"    : analyzers.max_drawdown(self.day_pnls, cfg.margin_per_lot, self._max_lots),
+            "calmar_gross" : calmar_g,
+            "calmar_net"   : calmar_n,
+            "churn"        : analyzers.churn(total_lots),
+            "total_costs"  : total_costs,
+            "n_fills"      : len(tl) if not tl.empty else 0,
+        })
+        return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in out.items()}
 
+
+# ---------------------------------------------------------------------------
+# BirdsEye
+# ---------------------------------------------------------------------------
 
 class BirdsEye:
     def __init__(self,
-                 data_dir        : str,
-                 strategy_cls    : Type,
-                 strategy_kwargs : Optional[dict] = None,
-                 fields          : Tuple[str, ...] = DEFAULT_FIELDS,   # -> Feed
-                 lot_size        : float = 1.0,                        # -> Portfolio + CostModel
-                 starting_cash   : float = 0.0,                        # -> Portfolio (fresh per day)
-                 cost_kwargs     : Optional[dict] = None,              # -> CostModel
-                 n_workers       : Optional[int] = None,               # -> ProcessPoolExecutor
-                 days            : Optional[List[str]] = None,         # subset, e.g. ["20240208"]
-                 curve_every     : int = 1):                           # equity downsample factor
-        self.data_dir        = data_dir
-        self.strategy_cls    = strategy_cls
-        self.strategy_kwargs = strategy_kwargs or {}
-        self.fields          = tuple(fields)
-        self.lot_size        = lot_size
-        self.starting_cash   = starting_cash
-        self.cost_kwargs     = cost_kwargs or {}
-        self.n_workers       = n_workers
-        self.days            = days
-        self.curve_every     = max(1, curve_every)
+                 data_dir          : str,
+                 strategy_cls      : Type,
+                 index             : str = "SPY",
+                 strategy_kwargs   : Optional[dict]   = None,
+                 fields            : Tuple[str, ...]  = DEFAULT_FIELDS,
+                 lot_size          : float = 1.0,
+                 starting_cash     : float = 0.0,
+                 margin_per_lot    : float = 0.0,
+                 cost_kwargs       : Optional[dict]   = None,
+                 n_workers         : Optional[int]    = None,
+                 days              : Optional[List[str]] = None,
+                 curve_every       : int  = 1,
+                 collect_perseclog : bool = False,
+                 periods_per_year  : Optional[int]    = None):
+
+        self.cfg = RunConfig(
+            lot_size         = lot_size,
+            starting_cash    = starting_cash,
+            margin_per_lot   = margin_per_lot,
+            periods_per_year = periods_per_year
+                               or PERIODS_PER_YEAR.get(index.upper(), 252),
+        )
+        self.data_dir          = data_dir
+        self.strategy_cls      = strategy_cls
+        self.strategy_kwargs   = strategy_kwargs or {}
+        self.fields            = tuple(fields)
+        self.cost_kwargs       = cost_kwargs or {}
+        self.n_workers         = n_workers
+        self.days              = days
+        self.curve_every       = max(1, curve_every)
+        self.collect_perseclog = collect_perseclog
 
     def _paths(self) -> List[str]:
         paths = sorted(glob.glob(os.path.join(self.data_dir, "*.parquet")))
@@ -194,18 +240,26 @@ class BirdsEye:
 
     def run(self, parallel: bool = True) -> Results:
         paths = self._paths()
-        jobs  = [(p, self.strategy_cls, self.strategy_kwargs, self.fields, self.lot_size, self.starting_cash, self.cost_kwargs, self.curve_every) for p in paths]
+        jobs  = [
+            (p, self.strategy_cls, self.strategy_kwargs, self.fields,
+            self.cfg, self.cost_kwargs, self.curve_every, self.collect_perseclog)
+            for p in paths
+        ]
 
         n = min(self.n_workers or (os.cpu_count() or 1), len(paths))
         if parallel and n > 1:
-            with ProcessPoolExecutor(max_workers=n) as ex:
-                outs = list(ex.map(_run_one_day, jobs))      # preserves order
+            with ProcessPoolExecutor(max_workers=n) as ex:   # context manager — critical
+                outs = list(ex.map(_run_one_day, jobs, chunksize=1))
         else:
             outs = [_run_one_day(j) for j in jobs]
 
-        days      = [o[0] for o in outs]
-        curves    = {o[0]: o[1] for o in outs}
-        Tradelogs = {o[0]: o[2] for o in outs}
-        pnls      = [o[3] for o in outs]
-        perseclogs = {o[0]: o[4] for o in outs}
-        return Results(days, curves, Tradelogs, pnls, self.starting_cash, self.lot_size, perseclogs)
+        return Results(
+            days             = [o[0] for o in outs],
+            curves           = {o[0]: o[1] for o in outs},
+            tradelogs        = {o[0]: o[2] for o in outs},
+            day_pnls         = [o[3] for o in outs],
+            cfg              = self.cfg,
+            perseclogs       = {o[0]: o[4] for o in outs},
+            traded_lots_list = [o[5] for o in outs],
+            max_lots         = outs[0][6],
+        )
