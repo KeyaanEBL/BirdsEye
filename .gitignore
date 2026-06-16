@@ -6,6 +6,9 @@ logs/
 
 # python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 *.py[cod]
 *.egg-info/
 .venv/
