@@ -118,8 +118,8 @@ class Short(State):
         ctx["short_atm"] = atm
         return Order(
             name="range_straddle",
-            legs=[OrderLeg(atm, "CE", lots=lots, action="SELL"),
-                  OrderLeg(atm, "PE", lots=lots, action="SELL")],
+            legs=[OrderLeg(atm, "CE", lots=lots, action="SELL", slice_lots=5, pause=2),
+                  OrderLeg(atm, "PE", lots=lots, action="SELL", slice_lots=5, pause=2)],
             reason=Reason(state="SHORT", note=f"range_prob={alphas['range_prob']:.2f}"),
         )
 
@@ -157,9 +157,7 @@ class Flatten(State):
 # ---- strategy --------------------------------------------------------------
 
 class LogRegRangeStraddle(StateMachineStrategy):
-    states     = {"WAIT": Wait(), "SHORT": Short(), "FLATTEN": Flatten()}
-    slice_lots = 5
-    pause      = 2
+    states = {"WAIT": Wait(), "SHORT": Short(), "FLATTEN": Flatten()}
 
     def __init__(self, broker, logreg, regime_config, index="SPY",
                  lots=1,
