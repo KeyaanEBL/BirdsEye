@@ -31,103 +31,159 @@ Feed ──► Snapshot ──► Strategy (FSM) ──► Executing ──► B
 ### 1. Define a strategy (as an importable module in `strategies/`)
 
 ```python
-# strategies/range_short_straddle.py
+# strategies/range_short_strangle.py
 from engine import Order, OrderLeg, Reason, State, StateMachineStrategy, Context
 
 
 class Wait(State):
     name = "WAIT"
-    transitions = {"calm_entry": "SHORT"}          # guard name -> destination
+    transitions = {"calm_entry": "SHORT"}           # guard name -> destination
 
     def target(self, alphas, ctx):
         atm = ctx.get("short_atm")
         if atm is None:
-            return None                            # nothing to unwind yet
+            return None                             # nothing to unwind yet
         return ctx["strat"].close_legs([(atm, "CE"), (atm, "PE")],
                                        reason=Reason(state="WAIT", note="square off"))
 
 
 class Short(State):
     name = "SHORT"
-    transitions = {"hold_elapsed": "WAIT"}
+    transitions = {
+        "stop_hit":      "WAIT",
+        "hold_elapsed":  "WAIT",
+    }
 
     def target(self, alphas, ctx):
-        atm = alphas["atm"]
-        ctx["short_atm"] = atm
+        atm  = alphas["atm"]
         lots = ctx["strat"].lots
-        return Order(name="short_straddle",
-                     legs=[OrderLeg(atm, "CE", lots=lots, action="SELL"),
-                           OrderLeg(atm, "PE", lots=lots, action="SELL")],
-                     reason=Reason(state="SHORT"))
+        wing = ctx["strat"].wing_strikes          # OTM strikes for strangle legs
+        ctx["short_atm"] = atm
+        ctx["entry_premium"] = alphas["straddle_mid"]
+        return Order(
+            name="short_strangle",
+            legs=[
+                OrderLeg(wing["CE"], "CE", lots=lots, action="SELL"),
+                OrderLeg(wing["PE"], "PE", lots=lots, action="SELL"),
+            ],
+            reason=Reason(state="SHORT"),
+        )
 
     def on_enter(self, ctx):                       # runs at FILL-COMPLETE
         ctx["entry_sec"] = ctx["now_sec"]
 
 
-class RangeShortStraddle(StateMachineStrategy):
-    states = {"WAIT": Wait(), "SHORT": Short()}
+class RangeShortStrangle(StateMachineStrategy):
+    states     = {"WAIT": Wait(), "SHORT": Short()}
     slice_lots = 100
-    pause = 0
+    pause      = 0
 
-    def __init__(self, broker, lots=1, range_win=600, decision_every=1200,
-                 hold=600, range_bps_max=15.0, session_len=23400):
-        self.lots = lots
-        self.range_win, self.decision_every = range_win, decision_every
-        self.hold, self.range_bps_max, self.session_len = hold, range_bps_max, session_len
-        self.min_history = range_win               # warm-up: no decisions before this
+    def __init__(self, broker, lots=1, max_lots=None,
+                 range_win=600, decision_every=1200,
+                 hold=600, range_bps_max=15.0,
+                 wing_offset=50, stop_mult=2.0,
+                 session_len=23400):
+        self.lots            = lots
+        self.max_lots        = max_lots or lots       # caps margin calculation
+        self.range_win       = range_win
+        self.decision_every  = decision_every
+        self.hold            = hold
+        self.range_bps_max   = range_bps_max
+        self.wing_offset     = wing_offset            # OTM distance in strike points
+        self.stop_mult       = stop_mult
+        self.session_len     = session_len
+        self.min_history     = range_win              # warm-up: no decisions before this
+
         ctx = Context()
         ctx["next_decision"] = decision_every
-        ctx["short_atm"] = None
-        super().__init__("WAIT", broker, name="range_short_straddle", context=ctx)
+        ctx["short_atm"]     = None
+        ctx["entry_sec"]     = 0
+        ctx["entry_premium"] = 0.0
+        super().__init__("WAIT", broker, name="range_short_strangle", context=ctx)
         ctx["strat"] = self
 
     # ---- named guards: documented, testable, ledger-visible ----
     def guard_calm_entry(self, a, c):
-        return (a["decision_now"] and a["range_bps"] < self.range_bps_max
+        return (a["decision_now"]
+                and a["range_bps"] < self.range_bps_max
                 and a["sec"] < self.session_len - self.hold)
+
+    def guard_stop_hit(self, a, c):
+        return a["straddle_mid"] > c["entry_premium"] * self.stop_mult
 
     def guard_hold_elapsed(self, a, c):
         return a["sec"] - c["entry_sec"] >= self.hold
 
-    # ---- alphas, computed every second ----
+    # ---- alphas, computed every second -------------------------
     def compute_alphas(self, snap):
-        c = self.context
+        c   = self.context
         sec = snap.i
-        h = snap.spot_hist(self.range_win)         # trailing window, lookahead-safe
+        atm = snap.atm_strike(quoted_only=True)
+
+        h   = snap.spot_hist(self.range_win)
         rng = (h.max() - h.min()) / snap.spot * 1e4
+
         decide = sec >= c["next_decision"]
         if decide:
             c["next_decision"] += self.decision_every
         c["now_sec"] = sec
-        return {"sec": sec, "spot": snap.spot,
-                "atm": snap.atm_strike(quoted_only=True),   # only strikes with live quotes
-                "range_bps": rng, "decision_now": decide}
+
+        # OTM wing strikes for the strangle
+        wing = {"CE": atm + self.wing_offset, "PE": atm - self.wing_offset}
+
+        # current straddle mid at ATM (stop reference)
+        ce_mid = snap.mid_half(atm, "CE") * 2
+        pe_mid = snap.mid_half(atm, "PE") * 2
+        straddle_mid = ce_mid + pe_mid
+
+        return {
+            "sec":          sec,
+            "spot":         snap.spot,
+            "atm":          atm,
+            "range_bps":    rng,
+            "decision_now": decide,
+            "straddle_mid": straddle_mid,
+        }
+
+    @property
+    def wing_strikes(self):
+        return {"CE": self._last_atm + self.wing_offset,
+                "PE": self._last_atm - self.wing_offset}
 ```
 
 ### 2. Run it
 
 ```python
 from engine import BirdsEye
-from strategies.range_short_straddle import RangeShortStraddle
+from strategies.range_short_strangle import RangeShortStrangle
 
 be = BirdsEye(
-    data_dir        = "/path/to/SPY/0-dte/train",      # one parquet per day
-    strategy_cls    = RangeShortStraddle,
-    strategy_kwargs = {"lots": 1, "range_bps_max": 15.0},
-    fields          = ("bid_0", "ask_0"),              # per-strike fields to load
-    lot_size        = 100,
-    starting_cash   = 1000.0,                          # fresh capital every day
-    cost_kwargs     = {"txn_cost_per_lot": 0.85},      # or {"txn_cost_bps": 15}
-    n_workers       = 36,
+    data_dir          = "/path/to/SPY/0-dte/train",   # one parquet per day
+    strategy_cls      = RangeShortStrangle,
+    index             = "SPY",                         # "SPY" (252) or "NIFTY" (52)
+    lot_size          = 100,
+    starting_cash     = 1_000_000.0,                  # fresh capital every day
+    margin_per_lot    = 10_000.0,                      # used for CAGR / Calmar
+    strategy_kwargs   = {"lots": 10, "max_lots": 10},
+    cost_kwargs       = {"txn_cost_per_lot": 0.85},    # or {"txn_cost_bps": 15}
+    n_workers         = 20,
+    collect_perseclog = True,                          # False by default; ~5–10x IPC cost
 )
 res = be.run()          # one process per day, chronological order preserved
 ```
+
+**`index`** controls the annualisation multiplier used in CAGR and Calmar:
+`"SPY"` → 252 trading days/year, `"NIFTY"` → 52 expiry weeks/year.
+
+**`margin_per_lot`** is the per-lot capital requirement. `margin = margin_per_lot × max_lots` is the denominator for all return and drawdown normalisations. Set it to match the actual margin your broker charges for the strategy's maximum open position.
+
+**`collect_perseclog`** defaults to `False` because the per-second flight recorder adds roughly 5–10× to the IPC pickle cost per worker. Set it to `True` when you need intraday diagnostics (`res.perseclog(day)`).
 
 ### 3. Inspect everything
 
 ```python
 res.summary                 # per-day table: fills / gross / costs / net
-res.stats()                 # CAGR, Calmar, churn, win rate, drawdowns, costs ... (2dp)
+res.stats()                 # CAGR, Calmar, churn, win rate, drawdowns, costs … (2dp)
 res.tearsheet()             # daily PnL + stitched equity + drawdown figure
 res.plot_day("20240208")    # one day's intraday MtM with buy/sell markers
 res.Tradelog()              # every fill, every day, one DataFrame
@@ -191,12 +247,12 @@ Fills happen **at mid** for every leg, regardless of direction. The bid/ask spre
 
 | Cost | Formula | Configure |
 |---|---|---|
-| Spread | `half_spread × lot_size × lots` | derived from the quote |
+| Spread | `half_spread × lot_size × lots` | derived from the live quote |
 | Transaction (absolute) | `txn_cost_per_lot × lots` | e.g. SPY: `{"txn_cost_per_lot": 0.85}` |
 | Transaction (percentage) | `bps of (mid × lot_size × lots)` | e.g. NIFTY: `{"txn_cost_bps": 15}` |
-| Brokerage | `brokerage_per_lot × lots` | optional |
+| Brokerage | `brokerage_per_lot × lots` | optional, additive |
 
-Both transaction modes can be combined (they sum). Mark-to-market is always at mid, so the equity curve never double-counts the spread: a fresh position shows zero unrealized PnL and a cash debit equal to its frictions — which is also a handy correctness check.
+Both transaction modes can be combined (they sum). Mark-to-market is always at mid, so the equity curve never double-counts the spread: a fresh position shows zero unrealized PnL and a cash debit equal to its frictions — a handy correctness check.
 
 PnL accounting uses weighted-average cost basis; realized PnL books when a position is reduced or closed.
 
@@ -206,12 +262,24 @@ PnL accounting uses weighted-average cost basis; realized PnL books when a posit
 
 `res.stats()` reports (all at 2dp):
 
-- per-day: total / average PnL, win rate, % positive/negative days, average win/loss, best/worst day
-- **CAGR** — compounded from daily returns on the fixed per-day capital
-- **Calmar** — classic definition: CAGR / |max %drawdown| of the compounded daily curve
-- **churn_per_day** — total traded notional / (capital × days): how many times per day the capital cycles in and out
-- max drawdown three ways: %, $ on the daily curve, and $ intraday across every second
-- total frictions and fill count
+**Per-day breakdown**
+- total / average PnL, win rate, % positive/negative days, average win/loss, best/worst day
+
+**Return metrics**
+
+| Metric | Formula |
+|---|---|
+| **CAGR (gross/net)** | `(total_pnl × periods_per_year) / (margin × n_days)` |
+| **Calmar** | `CAGR / \|max % drawdown\|` on the compounded daily curve |
+| **churn_per_day** | `total_traded_lots / 2` — round-trips per day |
+
+Where `margin = margin_per_lot × max_lots` and `periods_per_year` is set by the `index` parameter (252 for SPY, 52 for NIFTY).
+
+**Drawdown**
+- Max drawdown three ways: % and $ on the compounded daily curve; $ intraday across every second (`max(cumsum.cummax − cumsum)`, normalised by margin)
+
+**Costs**
+- Total frictions (spread + transaction), total fill count, average cost per round-trip
 
 ---
 
@@ -233,7 +301,7 @@ BirdsEye/
 │   ├── plots.py         # equity / drawdown / daily-PnL helpers
 │   └── runner.py        # BirdsEye + Results — parallel orchestration
 ├── strategies/          # one importable module per strategy
-│   └── range_short_straddle.py
+│   └── range_short_strangle.py
 └── README.md
 ```
 
@@ -249,6 +317,8 @@ Requirements: Python ≥ 3.9, `numpy`, `pandas`, `pyarrow`, `matplotlib`.
 - **One order in flight per strategy.** "Wait out the old order" removes the queue, the residual reconciliation, and the stale-intent problem in one move.
 - **Fail loudly.** Unquoted strikes raise with the leg names; worker errors carry their day name. A silent empty day costs an afternoon; a loud one costs a minute.
 - **Pure per-day workers.** Each day builds a fresh feed/portfolio/broker/strategy, which makes day-level parallelism trivially safe and results order-independent.
+
+---
 
 ## Roadmap
 
