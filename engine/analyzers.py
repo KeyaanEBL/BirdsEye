@@ -39,19 +39,29 @@ def daily_stats(day_pnls: List[float]) -> Dict[str, float]:
     }
 
 
+def max_drawdown(day_pnls_net  : List[float],
+                 day_pnls_gross: List[float],
+                 margin_per_lot: float,
+                 max_lots      : float) -> Tuple[float, float]:
+    """Max drawdown as % of deployed margin, gross and net separately."""
+    margin = margin_per_lot * max_lots
+    if margin == 0:
+        return 0.0, 0.0
+
+    def _dd(pnls):
+        cs   = np.cumsum(pnls)
+        peak = np.maximum.accumulate(cs)
+        return float((peak - cs).max()) * 100 / margin
+
+    return _dd(day_pnls_gross), _dd(day_pnls_net)
+
+
 def cagr(day_pnls         : List[float],
          total_costs      : float,
          margin_per_lot   : float,
          max_lots         : float,
          periods_per_year : int = 252) -> Tuple[float, float]:
-    """
-    Annualised return on margin, two variants.
-      gross : mid_pnl              (net + costs, no friction)
-      net   : mid_pnl - total_costs
-    Formula: (total_pnl * periods_per_year) / (margin * n_days)
-    margin = margin_per_lot * max_lots
-    periods_per_year: 252 SPY daily, 52 NIFTY/SENSEX weekly-expiry
-    """
+    """(total_pnl * periods_per_year) / (margin * n_days), gross and net."""
     n      = len(day_pnls)
     margin = margin_per_lot * max_lots
     if n == 0 or margin == 0:
@@ -59,40 +69,22 @@ def cagr(day_pnls         : List[float],
     net_pnl   = sum(day_pnls)
     gross_pnl = net_pnl + total_costs
     denom     = margin * n
-    return float(gross_pnl * periods_per_year / denom) * 100, \
-           float(net_pnl   * periods_per_year / denom) * 100
+    return (float(gross_pnl * periods_per_year / denom) * 100,
+            float(net_pnl   * periods_per_year / denom) * 100)
 
 
-def max_drawdown(day_pnls       : List[float],
-                     margin_per_lot : float,
-                     max_lots       : float) -> float:
-    """Max drawdown as a fraction of deployed margin."""
-    cs   = np.cumsum(day_pnls)
-    peak = np.maximum.accumulate(cs)
-    margin = margin_per_lot * max_lots
-    if margin == 0:
-        return 0.0
-    return float((peak - cs).max()) * 100 / margin
-
-
-def calmar(day_pnls         : List[float],
-           total_costs      : float,
-           margin_per_lot   : float,
-           max_lots         : float,
-           periods_per_year : int = 252) -> Tuple[float, float]:
-    """calmar_gross, calmar_net = cagr / |max_drawdown_pct|."""
-    dd = abs(max_drawdown(day_pnls, margin_per_lot, max_lots))
-    if dd == 0:
-        return float("nan"), float("nan")
-    cagr_gross, cagr_net = cagr(day_pnls, total_costs, margin_per_lot, max_lots, periods_per_year)
-    return cagr_gross / dd, cagr_net / dd
+def calmar(cagr_gross: float,
+           cagr_net  : float,
+           dd_gross  : float,
+           dd_net    : float) -> Tuple[float, float]:
+    """cagr / |maxDD| — pass already-computed values to avoid recomputing."""
+    calmar_g = cagr_gross / dd_gross if dd_gross != 0 else float("nan")
+    calmar_n = cagr_net   / dd_net   if dd_net   != 0 else float("nan")
+    return calmar_g, calmar_n
 
 
 def churn(total_traded_lots: float) -> float:
-    """
-    Round-trip count: total lots traded (all buys + sells) / 2.
-    churn=1 -> one complete open+close cycle across all legs.
-    """
+    """Total lots traded / 2 — one complete open+close = 1."""
     return float(total_traded_lots / 2)
 
 

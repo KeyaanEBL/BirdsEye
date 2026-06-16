@@ -175,25 +175,30 @@ class Results:
         total_lots  = np.mean(self._traded_lots)
         cfg         = self.cfg
 
-        cagr_g, cagr_n     = analyzers.cagr(
+        day_costs_list = [self.tradelogs[d].total_costs for d in self.days]
+        day_pnls_gross = [n + c for n, c in zip(self.day_pnls, day_costs_list)]
+
+        cagr_g, cagr_n   = analyzers.cagr(
             self.day_pnls, total_costs,
             cfg.margin_per_lot, self._max_lots, cfg.periods_per_year,
         )
-        calmar_g, calmar_n = analyzers.calmar(
-            self.day_pnls, total_costs,
-            cfg.margin_per_lot, self._max_lots, cfg.periods_per_year,
+        dd_g, dd_n       = analyzers.max_drawdown(
+            self.day_pnls, day_pnls_gross,
+            cfg.margin_per_lot, self._max_lots,
         )
+        calmar_g, calmar_n = analyzers.calmar(cagr_g, cagr_n, dd_g, dd_n)
 
         out = dict(analyzers.daily_stats(self.day_pnls))
         out.update({
-            "cagr_gross"   : cagr_g,
-            "cagr_net"     : cagr_n,
-            "maxDD_pct"    : analyzers.max_drawdown(self.day_pnls, cfg.margin_per_lot, self._max_lots),
-            "calmar_gross" : calmar_g,
-            "calmar_net"   : calmar_n,
-            "churn"        : analyzers.churn(total_lots),
-            "total_costs"  : total_costs,
-            "n_fills"      : len(tl) if not tl.empty else 0,
+            "cagr_gross"    : cagr_g,
+            "maxDD_gross"   : dd_g,
+            "calmar_gross"  : calmar_g,
+            "cagr_net"      : cagr_n,
+            "maxDD_net"     : dd_n,
+            "calmar_net"    : calmar_n,
+            "n_fills"       : len(tl) if not tl.empty else 0,
+            "churn"         : analyzers.churn(total_lots),
+            "total_costs"   : total_costs,
         })
         return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in out.items()}
 
