@@ -83,9 +83,9 @@ def calmar(cagr_gross: float,
     return calmar_g, calmar_n
 
 
-def churn(total_traded_lots: float) -> float:
+def churn(total_traded_lots: float, max_lots: float) -> float:
     """Total lots traded / 2 — one complete open+close = 1."""
-    return float(total_traded_lots / 2)
+    return float(total_traded_lots / 4) / max_lots if max_lots != 0 else float("nan")
 
 
 def cost_stats(Tradelog: Tradelog) -> Dict[str, float]:
