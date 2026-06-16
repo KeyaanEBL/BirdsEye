@@ -12,7 +12,7 @@ with no change needed here.
 from typing import List
 
 from .snapshot import MarketSnapshot
-from .orders import Order
+from .orders import Order, OrderLeg, Reason
 from .costs import CostModel
 from .ledger import Tradelog, Fill
 from .portfolio import Portfolio
@@ -54,3 +54,24 @@ class Broker:
 
     def mark_to_market(self, snap: MarketSnapshot) -> float:
         return self.portfolio.mark_to_market(snap)
+    
+    def eod_square_off(self, snap) -> list:
+        fills = []
+        for (strike, opt_type), pos in self.portfolio.positions.items():
+            if pos.lots == 0:
+                continue
+            leg = OrderLeg(
+                strike,
+                opt_type,
+                lots       = abs(pos.lots),
+                action     = "SELL" if pos.lots > 0 else "BUY",
+                slice_lots = abs(pos.lots),
+                pause      = 0,
+            )
+            order = Order(
+                legs   = [leg],
+                name   = "eod_square_off",
+                reason = Reason(state="EOD", note="end of day force close"),
+            )
+            fills += self.execute(order, snap)
+        return fills

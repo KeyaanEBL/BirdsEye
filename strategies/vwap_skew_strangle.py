@@ -17,14 +17,25 @@ The four regimes (evaluated top-down each second; first match wins)
 ------------------------------------------------------------------
 1. spot >= VWAP + dev_bps_thresh   (default +20 bps)  -> SKEW: short PUT far
    from ATM (-3 strikes) + short CALL near ATM (+1 strike). Pyramided entry,
-   trailing stop + profit limit, max-hold 20 min.
+   risk-managed exits (profit-take / fixed stop-loss / trailing), max-hold 20 min.
 2. spot <= VWAP - dev_bps_thresh   (default -20 bps)  -> SKEW: mirror of (1):
    short CALL far (+3) + short PUT near (-1). Same pyramid / stop / hold rules.
 3. else if trailing-15-min range < range_bps_max (default 15 bps) -> TIGHT
    strangle on the two strikes that bracket spot most tightly. All 10/side at
-   once, hold 30 min, square off.
+   once; same profit-take / stop-loss / trailing exits, else hold 30 min.
 4. else -> WIDE strangle at +4 / -4. The "park the cash" fallback; held until a
-   better regime (1/2/3) appears or end-of-day flatten.
+   better regime (1/2/3) appears, a stop fires, or end-of-day flatten.
+
+Risk-managed exits (every short position)
+-----------------------------------------
+Skew, tight AND wide positions are watched on mark-to-market PnL and squared off
+on the first of: a profit target, a fixed stop-loss, or a trailing stop. All three
+are anchored to `credit` (premium received ~ peak short notional), so they auto-
+scale with size; each also has an absolute-$ override. Defaults: take 25% of credit
+(profit_take_frac), cut at a 40%-of-credit loss (stop_loss_frac), and — once up by
+15% of credit (trail_arm_frac) — exit on giving back 15% of credit from the peak
+(trail_frac). The ledger `signal` records which fired: profit_take / stop_loss /
+trailing, plus skew_maxhold / tight_done, and the wide_to_* regime yields.
 
 Pyramided entry (regimes 1 & 2 only)
 ------------------------------------
@@ -128,8 +139,8 @@ class SkewAdd(State):
         ce, pe = ctx["skew_ce"], ctx["skew_pe"]
         return Order(
             name="skew_pyramid",
-            legs=[OrderLeg(ce, "CE", lots=lots, action="SELL"),
-                  OrderLeg(pe, "PE", lots=lots, action="SELL")],
+            legs=[OrderLeg(ce, "CE", lots=lots, action="SELL", slice_lots=lots, pause=0),
+                  OrderLeg(pe, "PE", lots=lots, action="SELL", slice_lots=lots, pause=0)],
             reason=Reason(state="SKEW_ADD", note=f"{ctx['skew_side']}|group{g}x{lots}"),
         )
 
@@ -150,9 +161,12 @@ class SkewHold(State):
     over scaling; if the 30s window was unprofitable we freeze the pyramid."""
     name = "SKEW_HOLD"
     transitions = {
-        "skew_exit":   "WAIT",          # trailing stop / profit limit / 20-min max-hold
-        "skew_add":    "SKEW_ADD",      # 30s elapsed AND window profitable AND group < n
-        "skew_freeze": "SKEW_FROZEN",   # 30s elapsed AND window NOT profitable
+        "profit_take":   "WAIT",        # banked target profit
+        "stop_loss":     "WAIT",        # fixed stop-loss hit
+        "trailing":      "WAIT",        # trailing stop hit
+        "skew_maxhold":  "WAIT",        # 20-min max-hold (from the first slice)
+        "skew_add":      "SKEW_ADD",    # 30s elapsed AND window profitable AND group < n
+        "skew_freeze":   "SKEW_FROZEN", # 30s elapsed AND window NOT profitable
     }
 
     def target(self, alphas, ctx):
@@ -162,7 +176,10 @@ class SkewHold(State):
 class SkewFrozen(State):
     """Pyramid stopped scaling (a 30s window failed). Just hold to an auto-exit."""
     name = "SKEW_FROZEN"
-    transitions = {"skew_exit": "WAIT"}
+    transitions = {
+        "profit_take": "WAIT", "stop_loss": "WAIT",
+        "trailing":    "WAIT", "skew_maxhold": "WAIT",
+    }
 
     def target(self, alphas, ctx):
         return None
@@ -171,7 +188,10 @@ class SkewFrozen(State):
 class TightStrangle(State):
     """Regime 3: short the two strikes bracketing spot, all 10/side at once, 30-min hold."""
     name = "TIGHT"
-    transitions = {"tight_done": "WAIT"}
+    transitions = {
+        "profit_take": "WAIT", "stop_loss": "WAIT",
+        "trailing":    "WAIT", "tight_done":  "WAIT",
+    }
 
     def target(self, alphas, ctx):
         strat = ctx["strat"]
@@ -179,8 +199,8 @@ class TightStrangle(State):
         ctx["tight_ce"], ctx["tight_pe"] = ce, pe
         return Order(
             name="tight_strangle",
-            legs=[OrderLeg(ce, "CE", lots=strat.lots, action="SELL"),
-                  OrderLeg(pe, "PE", lots=strat.lots, action="SELL")],
+            legs=[OrderLeg(ce, "CE", lots=strat.lots, action="SELL", slice_lots=strat.lots, pause=0),
+                  OrderLeg(pe, "PE", lots=strat.lots, action="SELL", slice_lots=strat.lots, pause=0)],
             reason=Reason(state="TIGHT", note="bracket strangle"),
         )
 
@@ -195,10 +215,12 @@ class WideStrangle(State):
     until a better regime appears or we flatten for the close."""
     name = "WIDE"
     transitions = {
+        "profit_take":  "WAIT",         # banked target profit
+        "stop_loss":    "WAIT",         # fixed stop-loss hit
+        "trailing":     "WAIT",         # trailing stop hit
         "wide_to_up":   "WAIT",         # regime 1 now available -> reopen as skew
         "wide_to_dn":   "WAIT",         # regime 2 now available
         "wide_to_calm": "WAIT",         # regime 3 now available
-        "wide_eod":     "WAIT",         # square off before the close
     }
 
     def target(self, alphas, ctx):
@@ -207,8 +229,8 @@ class WideStrangle(State):
         ctx["wide_ce"], ctx["wide_pe"] = ce, pe
         return Order(
             name="wide_strangle",
-            legs=[OrderLeg(ce, "CE", lots=strat.lots, action="SELL"),
-                  OrderLeg(pe, "PE", lots=strat.lots, action="SELL")],
+            legs=[OrderLeg(ce, "CE", lots=strat.lots, action="SELL", slice_lots=strat.lots, pause=0),
+                  OrderLeg(pe, "PE", lots=strat.lots, action="SELL", slice_lots=strat.lots, pause=0)],
             reason=Reason(state="WIDE", note="fallback +4/-4"),
         )
 
@@ -229,11 +251,7 @@ class VwapSkewStrangle(StateMachineStrategy):
         "TIGHT":       TightStrangle(),
         "WIDE":        WideStrangle(),
     }
-    # Every emitted order is <= `lots` per leg, so a large slice fills each one in
-    # a single tick. The 30s pyramid spacing is enforced by guard_skew_add — NOT
-    # by the slicer — so a one-tick fill per group is exactly what we want.
-    slice_lots = 10
-    pause      = 0
+    # slice_lots and pause are now per-OrderLeg (set on each leg in target()).
 
     def __init__(self, broker, lots=10,
                  dev_bps_thresh=20.0,          # |spot-VWAP| trigger for regimes 1/2 (bps)
@@ -243,12 +261,13 @@ class VwapSkewStrangle(StateMachineStrategy):
                  group_interval=30,            # seconds between pyramid groups
                  skew_max_hold=1200,           # regimes 1/2 max hold from first slice (20 min)
                  tight_hold=1800,              # regime 3 hold (30 min)
-                 profit_take_frac=0.40,        # profit limit as a fraction of credit collected
-                 trail_frac=0.25,              # trailing stop as a fraction of credit, off the peak
-                 profit_target=None,           # absolute profit limit ($); overrides the frac if set
-                 trail_stop=None,              # absolute trailing give-back ($); overrides the frac
-                 eod_buffer=120,               # flatten the fallback this many secs before close
-                 session_len=23400,            # session length in seconds (6.5h default)
+                 profit_take_frac=0.25,        # profit target as a fraction of credit received
+                 stop_loss_frac=0.40,          # FIXED stop: exit when loss >= this fraction of credit
+                 trail_arm_frac=0.15,          # trailing arms only once up >= this fraction of credit
+                 trail_frac=0.15,              # trailing give-back as a fraction of credit, off the peak
+                 profit_target=None,           # absolute profit target ($); overrides profit_take_frac
+                 stop_loss=None,               # absolute stop-loss ($ loss); overrides stop_loss_frac
+                 trail_stop=None,              # absolute trailing give-back ($); overrides trail_frac
                  vwap_use_volume=True,         # weight VWAP by traded volume when available
                  volume_field="volume",        # feed field holding per-second underlying volume
                  volume_is_cumulative=False,   # True if that column is a running total, not per-sec
@@ -263,11 +282,12 @@ class VwapSkewStrangle(StateMachineStrategy):
         self.skew_max_hold    = skew_max_hold
         self.tight_hold       = tight_hold
         self.profit_take_frac = profit_take_frac
+        self.stop_loss_frac   = stop_loss_frac
+        self.trail_arm_frac   = trail_arm_frac
         self.trail_frac       = trail_frac
         self.profit_target    = profit_target
+        self.stop_loss        = stop_loss
         self.trail_stop       = trail_stop
-        self.eod_buffer       = eod_buffer
-        self.session_len      = session_len
         self.vwap_use_volume      = vwap_use_volume
         self.volume_field         = volume_field
         self.volume_is_cumulative = volume_is_cumulative
@@ -400,7 +420,6 @@ class VwapSkewStrangle(StateMachineStrategy):
         c   = self.context
         sec = snap.i
         spot = snap.spot
-
         # --- the two headline alphas ---
         vwap     = self._vwap_now(snap)
         dev_bps  = (spot - vwap) / vwap * 1e4 if vwap else 0.0
@@ -434,10 +453,12 @@ class VwapSkewStrangle(StateMachineStrategy):
         upnl     = pf.unrealized_pnl(snap)
         notional = self._position_notional(snap)
 
-        # track the credit anchor (peak short notional) and the profit peak while in a skew
-        if c.get("episode") == "skew":
+        # track the credit anchor (peak short notional ~ premium received) and the profit
+        # peak while holding a risk-managed position, then classify any stop trigger.
+        if c.get("episode") in ("skew", "tight", "wide"):
             c["credit"]    = max(c.get("credit", 0.0), notional)
             c["peak_upnl"] = max(c.get("peak_upnl", upnl), upnl)
+        risk_reason = self._risk_reason(c, upnl)
 
         # stash scalars for on_enter hooks (which only receive ctx)
         c["now_sec"] = sec
@@ -445,6 +466,7 @@ class VwapSkewStrangle(StateMachineStrategy):
 
         return {
             "sec": sec, "spot": spot, "vwap": round(vwap, 4),
+            "risk_reason": risk_reason,
             "dev_bps": dev_bps, "range_bps": range_bps,
             "atm": atm, "upnl": upnl, "notional": notional,
             "group": float(c.get("group", 0)),
@@ -469,9 +491,13 @@ class VwapSkewStrangle(StateMachineStrategy):
     # ------------------------------------------------------------------ #
     # session-room helpers                                                #
     # ------------------------------------------------------------------ #
-    def _room_skew(self, a):   return a["sec"] <= self.session_len - self.skew_max_hold
-    def _room_tight(self, a):  return a["sec"] <= self.session_len - self.tight_hold
-    def _room_any(self, a):    return a["sec"] <= self.session_len - self.eod_buffer
+    # Only open if there's enough session left to complete the hold.
+    # sec = snap.i = seconds-from-open; full 0-DTE session = 23400s.
+    # The runner's broker.eod_square_off() handles any position still open
+    # at the last bar, so no intraday EOD guard is needed here.
+    def _room_skew(self, a):   return a["sec"] <= 23400 - self.skew_max_hold
+    def _room_tight(self, a):  return a["sec"] <= 23400 - self.tight_hold
+    def _room_any(self, a):    return True  # wide has no hold timer; enter any time
 
     # ------------------------------------------------------------------ #
     # named guards (ledger-visible: the `signal` column records which fired)
@@ -508,23 +534,34 @@ class VwapSkewStrangle(StateMachineStrategy):
         profitable = a["upnl"] - c.get("window_start_upnl", 0.0) > 0.0
         return (not profitable) or (a["skew_legs_ok"] <= 0)
 
-    def guard_skew_exit(self, a, c):
-        """Trailing stop OR profit limit OR 20-min max-hold (from the first slice)."""
-        if c.get("episode") != "skew":
-            return False
-        sec, upnl = a["sec"], a["upnl"]
-        if sec - c.get("entry_sec", sec) >= self.skew_max_hold:        # max-hold
-            return True
+    # --- risk management: profit-take, fixed stop-loss, trailing stop ----------
+    # All anchored to `credit` (premium received ~ peak short notional). A fraction
+    # gives auto-scaling with size; an absolute override gives an exact $ level.
+    def _risk_reason(self, c, upnl):
+        """Return which stop (if any) is triggered now: 'profit_take' | 'stop_loss'
+        | 'trailing' | '' (none). Evaluated only while a credit is on the book."""
         credit = c.get("credit", 0.0)
-        if credit > 0.0:
-            target = self.profit_target if self.profit_target is not None else self.profit_take_frac * credit
-            if upnl >= target:                                          # profit limit
-                return True
-            trail = self.trail_stop if self.trail_stop is not None else self.trail_frac * credit
-            peak  = c.get("peak_upnl", upnl)
-            if upnl < peak and upnl <= peak - trail:                    # trailing stop
-                return True
-        return False
+        if credit <= 0.0:
+            return ""
+        pt = self.profit_target if self.profit_target is not None else self.profit_take_frac * credit
+        if upnl >= pt:
+            return "profit_take"
+        sl = self.stop_loss if self.stop_loss is not None else self.stop_loss_frac * credit
+        if upnl <= -sl:
+            return "stop_loss"
+        peak = c.get("peak_upnl", upnl)
+        if peak >= self.trail_arm_frac * credit:
+            give = self.trail_stop if self.trail_stop is not None else self.trail_frac * credit
+            if upnl <= peak - give:
+                return "trailing"
+        return ""
+
+    def guard_profit_take(self, a, c):  return a.get("risk_reason") == "profit_take"
+    def guard_stop_loss(self, a, c):    return a.get("risk_reason") == "stop_loss"
+    def guard_trailing(self, a, c):     return a.get("risk_reason") == "trailing"
+
+    def guard_skew_maxhold(self, a, c):
+        return c.get("episode") == "skew" and a["sec"] - c.get("entry_sec", a["sec"]) >= self.skew_max_hold
 
     # --- TIGHT (regime 3) ---
     def guard_tight_done(self, a, c):
@@ -539,6 +576,3 @@ class VwapSkewStrangle(StateMachineStrategy):
 
     def guard_wide_to_calm(self, a, c):
         return a["range_bps"] < self.range_bps_max and a["t_ok"] > 0 and self._room_tight(a)
-
-    def guard_wide_eod(self, a, c):
-        return a["sec"] >= self.session_len - self.eod_buffer

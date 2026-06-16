@@ -1,97 +1,54 @@
 """vwap_skew_strangle_nofallback — a three-regime short-options strategy.
 
-This is the no-fallback sibling of `vwap_skew_strangle`: identical skew and tight
-logic, but with regime 4 (the wide "park the cash" strangle) removed entirely.
-When none of the three regimes apply the strategy simply stays FLAT — capital
-sits idle rather than shorting a wide strangle.
-
-This is a strategy *module* (importable, spawn-safe, testable) in the BirdsEye
-FSM style. Each trading second it classifies the tape from two alphas —
-spot-vs-VWAP deviation and the trailing 15-minute spot range — and holds the
-position that regime calls for (or nothing, if no regime fires).
-
-Sizing
-------
-20 lots total = 10 on the CALL branch + 10 on the PUT branch ("10 pairs").
-  * Regimes 1 & 2 build those 10 lots/side in a gated pyramid (1+2+3+4 = 10).
-  * Regime 3 takes all 10 lots/side in one shot.
+When none of the three regimes apply the strategy stays FLAT.
 
 The three regimes (evaluated top-down each second; first match wins)
 -------------------------------------------------------------------
-1. spot >= VWAP + dev_bps_thresh   (default +20 bps)  -> SKEW: short PUT far
-   from ATM (-3 strikes) + short CALL near ATM (+1 strike). Pyramided entry,
-   trailing stop + profit limit, max-hold 20 min.
-2. spot <= VWAP - dev_bps_thresh   (default -20 bps)  -> SKEW: mirror of (1):
-   short CALL far (+3) + short PUT near (-1). Same pyramid / stop / hold rules.
-3. else if trailing-15-min range < range_bps_max (default 15 bps) -> TIGHT
-   strangle on the two strikes that bracket spot most tightly. All 10/side at
-   once, hold 30 min, square off.
-4. else -> FLAT. No fallback position; wait for a regime to appear.
+1. spot >= VWAP + dev_bps_thresh (+20 bps) -> SKEW-UP:
+   short PUT far (ATM-3) + short CALL near (ATM+1).
+   Built in 4 pyramid groups (1+2+3+4 = 10 lots/side) at group_interval (2 min)
+   intervals. Gate to add the next group: spot is still >= the spot at the
+   window start (i.e. the move that triggered us is still intact).
+2. spot <= VWAP - dev_bps_thresh (-20 bps) -> SKEW-DOWN:
+   Mirror: short CALL far (ATM+3) + short PUT near (ATM-1). Same pyramid rules;
+   gate: spot still <= window-start spot.
+3. else, trailing range_win range < range_bps_max (15 bps) -> TIGHT:
+   Same 4-group pyramid at group_interval (2 min) intervals.
+   Gate to add the next group: the spot range over that window is still < range_bps_max
+   (market stayed calm). Strikes are the two that bracket spot most tightly.
 
-Pyramided entry (regimes 1 & 2 only)
-------------------------------------
-Groups of 1, 2, 3, 4 lots/side go in at 30-second intervals (so the build-out
-spans ~2 minutes). The next group only fires if the open position's mark-to-
-market profit over the last 30-second window was positive; the first window
-that fails freezes the pyramid at its current size (state SKEW_FROZEN) and we
-just hold. CALLs == PUTs in every slice. Max-hold and the auto stops are timed
-from the first slice.
+Pyramid freeze: if any window's gate fails (spot reversed / market woke up),
+no more groups are added. We hold what we have to the relevant exits.
 
-VWAP
-----
-Session-anchored, lookahead-safe VWAP of spot. When a per-second volume series
-is loaded into the feed (pass it via the `fields` arg to BirdsEye and name it
-with `volume_field`), VWAP[i] = sum(spot*vol)[0..i] / sum(vol)[0..i] — a true
-volume-weighted price. If that column is absent (or all-zero), we fall back to a
-session running mean of spot (a TWAP, == VWAP under uniform volume). Either way
-`vwap[i]` depends only on rows 0..i, so no future information leaks even though
-the cumulative arrays are built once and cached. Set `volume_is_cumulative=True`
-if your volume column is a running total rather than per-second turnover.
+Risk exits (every short position — skew AND tight)
+--------------------------------------------------
+Anchored to MARGIN (margin_per_lot * open_lots * 2 * lot_size), not credit.
+  * profit_take  : upnl >= profit_take_frac * margin   (default 2%)
+  * stop_loss    : upnl <= -stop_loss_frac * margin     (default 1%)
+  * trailing     : once up trail_arm_frac * margin, give back trail_frac * margin
+  * skew_maxhold / tight_done: time backstops
+  * day_stop     : if cumulative day PnL <= -day_stop_frac * total_margin
+                   (default 1%), block ALL new entries and exit any open position.
 
-Robust strike selection (no execution starvation)
--------------------------------------------------
-On real data a deep-OTM strike can be quoted one second and gone the next. Since
-the engine starves (raises) if it works an order for 60 ticks with no fill, every
-strike this strategy emits is taken from the *stably quoted* ladder — strikes
-whose CE and PE bid/ask have been continuously present for the last
-`quote_persist` seconds — so the leg is overwhelmingly likely to still be quoted
-when the slice fills the next tick. Pyramid adds re-check the locked strikes each
-group: if a locked leg has gone illiquid, the pyramid freezes instead of firing
-into a strike with no quote.
+Absolute $ overrides: profit_target, stop_loss_abs, trail_stop bypass the fractions.
 
-Run it (notebook / BirdsEye)
-----------------------------
-    from strategies.vwap_skew_strangle_nofallback import VwapSkewStrangleNoFallback
-    be = BirdsEye(
-        strategy_cls    = VwapSkewStrangleNoFallback,
-        index           = "SPY",
-        split           = "train",
-        strategy_kwargs = {"lots": 10},          # 10/side -> 20 lots total
-        lot_size        = 100,
-        starting_cash   = 1_000_000.0,
-        n_workers       = 40,
-    )
-    res = be.run()
+EOD: any position still open at the last bar is squared off by the runner.
 """
 
 import numpy as np
-
 from engine import Order, OrderLeg, Reason, State, StateMachineStrategy, Context
 
 
 # --------------------------------------------------------------------------- #
 # States                                                                       #
 # --------------------------------------------------------------------------- #
+
 class Wait(State):
-    """Flat hub. Entered both at session start and after every square-off — so
-    its target() flattens any legs still open, and its transitions pick the next
-    regime on the following second."""
     name = "WAIT"
     transitions = {
-        "above_vwap":    "SKEW_ADD",     # regime 1
-        "below_vwap":    "SKEW_ADD",     # regime 2
-        "calm_range":    "TIGHT",        # regime 3
-        # regime 4 (wide fallback) removed: no match -> stay flat in WAIT
+        "above_vwap": "SKEW_ADD",
+        "below_vwap": "SKEW_ADD",
+        "calm_range": "TIGHT_ADD",
     }
 
     def target(self, alphas, ctx):
@@ -101,7 +58,6 @@ class Wait(State):
         return ctx["strat"].close_legs(legs, reason=Reason(state="WAIT", note="square off"))
 
     def on_enter(self, ctx):
-        # reset the per-episode memory; we are flat now
         ctx["episode"]    = None
         ctx["open_legs"]  = None
         ctx["group"]      = 0
@@ -109,125 +65,179 @@ class Wait(State):
         ctx["peak_upnl"]  = 0.0
         ctx["skew_ce"]    = None
         ctx["skew_pe"]    = None
+        ctx["tight_ce"]   = None
+        ctx["tight_pe"]   = None
 
+
+# ---- SKEW states -----------------------------------------------------------
 
 class SkewAdd(State):
-    """Places ONE pyramid group (1/2/3/4 lots/side) for regime 1 or 2, at strikes
-    locked on the first group. Routes straight to SKEW_HOLD once the group fills."""
+    """Places ONE pyramid group for the skew regime, then routes to SKEW_HOLD."""
     name = "SKEW_ADD"
-    transitions = {"eod_flat": "WAIT", "always_hold": "SKEW_HOLD"}
+    transitions = {"always_hold": "SKEW_HOLD"}
 
     def target(self, alphas, ctx):
         strat = ctx["strat"]
-        if ctx.get("group", 0) == 0:                       # first group: choose side & lock strikes
-            if alphas["dev_bps"] >= 0:                     # regime 1: spot above VWAP
+        if ctx.get("group", 0) == 0:                  # first group: lock side & strikes
+            if alphas["dev_bps"] >= 0:
                 ce, pe, side = alphas["c1_ce"], alphas["c1_pe"], "above"
-            else:                                          # regime 2: spot below VWAP
+            else:
                 ce, pe, side = alphas["c2_ce"], alphas["c2_pe"], "below"
             ctx["skew_ce"], ctx["skew_pe"], ctx["skew_side"] = ce, pe, side
-        g    = ctx.get("group", 0) + 1                     # this group's number, 1..n
-        lots = strat.pyramid_schedule[g - 1]               # 1, 2, 3, 4
+        g    = ctx.get("group", 0) + 1
+        lots = strat.pyramid_schedule[g - 1]
         ce, pe = ctx["skew_ce"], ctx["skew_pe"]
         return Order(
             name="skew_pyramid",
-            legs=[OrderLeg(ce, "CE", lots=lots, action="SELL"),
-                  OrderLeg(pe, "PE", lots=lots, action="SELL")],
+            legs=[OrderLeg(ce, "CE", lots=lots, action="SELL", slice_lots=lots, pause=0),
+                  OrderLeg(pe, "PE", lots=lots, action="SELL", slice_lots=lots, pause=0)],
             reason=Reason(state="SKEW_ADD", note=f"{ctx['skew_side']}|group{g}x{lots}"),
         )
 
-    def on_enter(self, ctx):                               # runs at FILL-COMPLETE of the group
-        ctx["group"]    = ctx.get("group", 0) + 1
-        ctx["episode"]  = "skew"
+    def on_enter(self, ctx):
+        ctx["group"]   = ctx.get("group", 0) + 1
+        ctx["episode"] = "skew"
         ctx["open_legs"] = [(ctx["skew_ce"], "CE"), (ctx["skew_pe"], "PE")]
-        # open a fresh 30s profit-gate window from this fill
+        # start a fresh direction-gate window
         ctx["window_start_sec"]  = ctx["now_sec"]
-        ctx["window_start_upnl"] = ctx["upnl"]
-        if ctx["group"] == 1:                              # the first slice anchors the auto-exits
-            ctx["entry_sec"] = ctx["now_sec"]
-            ctx["peak_upnl"] = ctx["upnl"]                 # ~0 just after entry
+        ctx["window_start_spot"] = ctx["now_spot"]     # gate: spot direction
+        if ctx["group"] == 1:
+            ctx["entry_sec"]  = ctx["now_sec"]
+            ctx["peak_upnl"]  = ctx["upnl"]
 
 
 class SkewHold(State):
-    """Holding a (possibly still-building) skew position. Auto-exits win priority
-    over scaling; if the 30s window was unprofitable we freeze the pyramid."""
     name = "SKEW_HOLD"
     transitions = {
-        "eod_flat":    "WAIT",          # near close: flatten everything (highest priority)
-        "skew_exit":   "WAIT",          # trailing stop / profit limit / 20-min max-hold
-        "skew_add":    "SKEW_ADD",      # 30s elapsed AND window profitable AND group < n
-        "skew_freeze": "SKEW_FROZEN",   # 30s elapsed AND window NOT profitable
+        "day_stop":      "WAIT",
+        "profit_take":   "WAIT",
+        "stop_loss":     "WAIT",
+        "trailing":      "WAIT",
+        "skew_maxhold":  "WAIT",
+        "skew_add":      "SKEW_ADD",
+        "skew_freeze":   "SKEW_FROZEN",
     }
-
-    def target(self, alphas, ctx):
-        return None                     # pure holding state; never opens a trade itself
-
-
-class SkewFrozen(State):
-    """Pyramid stopped scaling (a 30s window failed). Just hold to an auto-exit."""
-    name = "SKEW_FROZEN"
-    transitions = {"eod_flat": "WAIT", "skew_exit": "WAIT"}
 
     def target(self, alphas, ctx):
         return None
 
 
-class TightStrangle(State):
-    """Regime 3: short the two strikes bracketing spot, all 10/side at once, 30-min hold."""
-    name = "TIGHT"
-    transitions = {"eod_flat": "WAIT", "tight_done": "WAIT"}
+class SkewFrozen(State):
+    """Pyramid frozen; hold to an auto-exit."""
+    name = "SKEW_FROZEN"
+    transitions = {
+        "day_stop":    "WAIT",
+        "profit_take": "WAIT",
+        "stop_loss":   "WAIT",
+        "trailing":    "WAIT",
+        "skew_maxhold":"WAIT",
+    }
+
+    def target(self, alphas, ctx):
+        return None
+
+
+# ---- TIGHT states ----------------------------------------------------------
+
+class TightAdd(State):
+    """Places ONE pyramid group for the tight-strangle regime, then routes to TIGHT_HOLD."""
+    name = "TIGHT_ADD"
+    transitions = {"always_hold": "TIGHT_HOLD"}
 
     def target(self, alphas, ctx):
         strat = ctx["strat"]
-        ce, pe = alphas["t_ce"], alphas["t_pe"]
-        ctx["tight_ce"], ctx["tight_pe"] = ce, pe
+        if ctx.get("group", 0) == 0:                  # first group: lock strikes
+            ctx["tight_ce"], ctx["tight_pe"] = alphas["t_ce"], alphas["t_pe"]
+        g    = ctx.get("group", 0) + 1
+        lots = strat.pyramid_schedule[g - 1]
+        ce, pe = ctx["tight_ce"], ctx["tight_pe"]
         return Order(
-            name="tight_strangle",
-            legs=[OrderLeg(ce, "CE", lots=strat.lots, action="SELL"),
-                  OrderLeg(pe, "PE", lots=strat.lots, action="SELL")],
-            reason=Reason(state="TIGHT", note="bracket strangle"),
+            name="tight_pyramid",
+            legs=[OrderLeg(ce, "CE", lots=lots, action="SELL", slice_lots=lots, pause=0),
+                  OrderLeg(pe, "PE", lots=lots, action="SELL", slice_lots=lots, pause=0)],
+            reason=Reason(state="TIGHT_ADD", note=f"tight|group{g}x{lots}"),
         )
 
     def on_enter(self, ctx):
-        ctx["episode"]   = "tight"
+        ctx["group"]   = ctx.get("group", 0) + 1
+        ctx["episode"] = "tight"
         ctx["open_legs"] = [(ctx["tight_ce"], "CE"), (ctx["tight_pe"], "PE")]
-        ctx["entry_sec"] = ctx["now_sec"]
+        # start a fresh range-gate window
+        ctx["window_start_sec"]        = ctx["now_sec"]
+        ctx["window_start_range_bps"]  = ctx["now_range_bps"]  # gate: range stayed calm
+        if ctx["group"] == 1:
+            ctx["entry_sec"] = ctx["now_sec"]
+            ctx["peak_upnl"] = ctx["upnl"]
+
+
+class TightHold(State):
+    name = "TIGHT_HOLD"
+    transitions = {
+        "day_stop":     "WAIT",
+        "profit_take":  "WAIT",
+        "stop_loss":    "WAIT",
+        "trailing":     "WAIT",
+        "tight_done":   "WAIT",
+        "tight_add":    "TIGHT_ADD",
+        "tight_freeze": "TIGHT_FROZEN",
+    }
+
+    def target(self, alphas, ctx):
+        return None
+
+
+class TightFrozen(State):
+    """Tight pyramid frozen; hold to an auto-exit."""
+    name = "TIGHT_FROZEN"
+    transitions = {
+        "day_stop":    "WAIT",
+        "profit_take": "WAIT",
+        "stop_loss":   "WAIT",
+        "trailing":    "WAIT",
+        "tight_done":  "WAIT",
+    }
+
+    def target(self, alphas, ctx):
+        return None
 
 
 # --------------------------------------------------------------------------- #
 # Strategy                                                                      #
 # --------------------------------------------------------------------------- #
+
 class VwapSkewStrangleNoFallback(StateMachineStrategy):
     states = {
-        "WAIT":        Wait(),
-        "SKEW_ADD":    SkewAdd(),
-        "SKEW_HOLD":   SkewHold(),
-        "SKEW_FROZEN": SkewFrozen(),
-        "TIGHT":       TightStrangle(),
+        "WAIT":         Wait(),
+        "SKEW_ADD":     SkewAdd(),
+        "SKEW_HOLD":    SkewHold(),
+        "SKEW_FROZEN":  SkewFrozen(),
+        "TIGHT_ADD":    TightAdd(),
+        "TIGHT_HOLD":   TightHold(),
+        "TIGHT_FROZEN": TightFrozen(),
     }
-    # Every emitted order is <= `lots` per leg, so a large slice fills each one in
-    # a single tick. The 30s pyramid spacing is enforced by guard_skew_add — NOT
-    # by the slicer — so a one-tick fill per group is exactly what we want.
-    slice_lots = 10
-    pause      = 0
 
-    def __init__(self, broker, lots=10,
+    def __init__(self, broker, max_lots=10, lots=10,
                  dev_bps_thresh=20.0,          # |spot-VWAP| trigger for regimes 1/2 (bps)
                  range_bps_max=15.0,           # trailing-range ceiling for regime 3 (bps)
                  range_win=900,                # trailing window for the range alpha (15 min)
-                 pyramid_schedule=(1, 2, 3, 4),# lots/side per slice; must sum to `lots`
-                 group_interval=30,            # seconds between pyramid groups
-                 skew_max_hold=1200,           # regimes 1/2 max hold from first slice (20 min)
-                 tight_hold=1800,              # regime 3 hold (30 min)
-                 profit_take_frac=0.40,        # profit limit as a fraction of credit collected
-                 trail_frac=0.25,              # trailing stop as a fraction of credit, off the peak
-                 profit_target=None,           # absolute profit limit ($); overrides the frac if set
-                 trail_stop=None,              # absolute trailing give-back ($); overrides the frac
-                 eod_buffer=120,               # flatten any open position this many secs before close
-                 session_len=23400,            # legacy; EOD now uses the feed's actual length
-                 vwap_use_volume=True,         # weight VWAP by traded volume when available
-                 volume_field="volume",        # feed field holding per-second underlying volume
-                 volume_is_cumulative=False,   # True if that column is a running total, not per-sec
-                 quote_persist=60):            # secs a strike must stay quoted to be tradable
+                 pyramid_schedule=(1, 2, 3, 4),# lots/side per group; must sum to `lots`
+                 group_interval=120,           # seconds between pyramid groups (2 min)
+                 skew_max_hold=7200,           # skew max hold from first slice (2 hr)
+                 tight_hold=7200,              # tight max hold from first slice (2 hr)
+                 margin_per_lot=10000.0,       # margin per lot per side (used for stop sizing)
+                 profit_take_frac=0.02,        # profit target as fraction of margin used
+                 stop_loss_frac=0.01,          # per-trade stop loss as fraction of margin used
+                 trail_arm_frac=0.015,         # trailing arms once up this fraction of margin
+                 trail_frac=0.010,             # trailing give-back as fraction of margin
+                 day_stop_frac=0.01,           # daily stop loss as fraction of total margin
+                 profit_target=None,           # absolute profit target ($); overrides frac
+                 stop_loss_abs=None,           # absolute per-trade stop ($ loss); overrides frac
+                 trail_stop=None,              # absolute trailing give-back ($); overrides frac
+                 vwap_use_volume=True,
+                 volume_field="volume",
+                 volume_is_cumulative=False,
+                 quote_persist=60):
+        self.max_lots         = max_lots,
         self.lots             = lots
         self.dev_bps_thresh   = dev_bps_thresh
         self.range_bps_max    = range_bps_max
@@ -237,12 +247,15 @@ class VwapSkewStrangleNoFallback(StateMachineStrategy):
         self.group_interval   = group_interval
         self.skew_max_hold    = skew_max_hold
         self.tight_hold       = tight_hold
+        self.margin_per_lot   = margin_per_lot
         self.profit_take_frac = profit_take_frac
+        self.stop_loss_frac   = stop_loss_frac
+        self.trail_arm_frac   = trail_arm_frac
         self.trail_frac       = trail_frac
+        self.day_stop_frac    = day_stop_frac
         self.profit_target    = profit_target
+        self.stop_loss_abs    = stop_loss_abs
         self.trail_stop       = trail_stop
-        self.eod_buffer       = eod_buffer
-        self.session_len      = session_len
         self.vwap_use_volume      = vwap_use_volume
         self.volume_field         = volume_field
         self.volume_is_cumulative = volume_is_cumulative
@@ -251,58 +264,73 @@ class VwapSkewStrangleNoFallback(StateMachineStrategy):
         assert sum(self.pyramid_schedule) == lots, \
             f"pyramid_schedule {self.pyramid_schedule} must sum to lots={lots}"
 
-        # warm-up: need a full range window of history before any decision
         self.min_history = range_win
 
         ctx = Context()
-        ctx["episode"]   = None
-        ctx["open_legs"] = None
-        ctx["group"]     = 0
-        ctx["credit"]    = 0.0
-        ctx["peak_upnl"] = 0.0
+        ctx["episode"]    = None
+        ctx["open_legs"]  = None
+        ctx["group"]      = 0
+        ctx["credit"]     = 0.0
+        ctx["peak_upnl"]  = 0.0
+        ctx["skew_ce"]    = None
+        ctx["skew_pe"]    = None
+        ctx["tight_ce"]   = None
+        ctx["tight_pe"]   = None
+        ctx["now_sec"]    = 0
+        ctx["now_spot"]   = 0.0
+        ctx["now_range_bps"] = 0.0
+        ctx["upnl"]       = 0.0
+        ctx["starting_equity"] = None      # set on first compute_alphas call
         super().__init__("WAIT", broker, name="vwap_skew_strangle_nofallback", context=ctx)
         ctx["strat"] = self
 
     # ------------------------------------------------------------------ #
-    # strike-grid helpers (the public snapshot API exposes ATM but not    #
-    # the ladder, so we read the feed's sorted strike array the same way  #
-    # MarketSnapshot.atm_strike(quoted_only=True) does)                   #
+    # Margin helper                                                        #
+    # ------------------------------------------------------------------ #
+    def _margin_used(self):
+        """Total margin currently posted: margin_per_lot * |open lots| summed
+        over all open legs. Lot size is already in margin_per_lot convention
+        (margin_per_lot is per contract, not per share)."""
+        pf    = self.broker.portfolio
+        total = 0.0
+        for pos in pf.positions.values():
+            if pos.lots != 0:
+                total += self.margin_per_lot * abs(pos.lots)
+        return total
+
+    def _total_day_margin(self):
+        """Maximum possible margin at full deployment: both sides, all lots."""
+        return self.margin_per_lot * self.lots * 2
+
+    # ------------------------------------------------------------------ #
+    # Strike-grid helpers                                                  #
     # ------------------------------------------------------------------ #
     @staticmethod
     def _quoted_ladder(snap):
-        """Sorted strikes that have live CE & PE bid/ask right now."""
         feed, i = snap._feed, snap.i
         strikes = feed.strikes
         ok = np.ones(len(strikes), dtype=bool)
-        for key in (("ce", "bid_0"), ("ce", "ask_0"), ("pe", "bid_0"), ("pe", "ask_0")):
+        for key in (("ce","bid_0"), ("ce","ask_0"), ("pe","bid_0"), ("pe","ask_0")):
             arr = feed.arrays.get(key)
             if arr is None:
-                return strikes                     # can't filter -> use the full grid
+                return strikes
             ok &= ~np.isnan(arr[i])
         return strikes[ok] if ok.any() else strikes
 
     def _stable_ladder(self, snap):
-        """Strikes whose CE & PE bid/ask have BOTH been continuously quoted over
-        the last `quote_persist` seconds. A strike alive that long is very unlikely
-        to vanish before the slice fills next tick — which is what keeps the engine
-        from starving. Falls back to the quoted-now ladder if nothing qualifies (or
-        if quote arrays aren't loaded)."""
         feed, i = snap._feed, snap.i
         strikes = feed.strikes
         lo      = max(0, i - self.quote_persist + 1)
         ok      = np.ones(len(strikes), dtype=bool)
-        for key in (("ce", "bid_0"), ("ce", "ask_0"), ("pe", "bid_0"), ("pe", "ask_0")):
+        for key in (("ce","bid_0"), ("ce","ask_0"), ("pe","bid_0"), ("pe","ask_0")):
             arr = feed.arrays.get(key)
             if arr is None:
                 return self._quoted_ladder(snap)
-            ok &= ~np.isnan(arr[lo:i + 1]).any(axis=0)
+            ok &= ~np.isnan(arr[lo:i+1]).any(axis=0)
         return strikes[ok] if ok.any() else self._quoted_ladder(snap)
 
     def _leg_stable(self, snap, strike, opt_type):
-        """True if this one (strike, opt_type) leg has had non-NaN bid & ask for the
-        last `quote_persist` secs. NOTE: field_hist keys arrays case-sensitively, so
-        opt_type is lowercased here to match the feed's 'ce'/'pe' arrays."""
-        if strike != strike:                       # NaN strike
+        if strike != strike:
             return False
         ot = opt_type.lower()
         b  = snap.field_hist(strike, ot, "bid_0", self.quote_persist)
@@ -313,7 +341,6 @@ class VwapSkewStrangleNoFallback(StateMachineStrategy):
 
     @staticmethod
     def _offset(ladder, atm, k):
-        """Strike k grid-steps from ATM (clamped to the ladder ends)."""
         if len(ladder) == 0:
             return float("nan")
         j  = int(np.argmin(np.abs(ladder - atm)))
@@ -322,7 +349,6 @@ class VwapSkewStrangleNoFallback(StateMachineStrategy):
 
     @staticmethod
     def _bracket(ladder, spot):
-        """The two strikes that most tightly bracket spot: (first above, first below)."""
         if len(ladder) == 0:
             return float("nan"), float("nan")
         above = ladder[ladder > spot]
@@ -331,107 +357,140 @@ class VwapSkewStrangleNoFallback(StateMachineStrategy):
         pe = float(below[-1]) if len(below) else float(ladder[0])
         return ce, pe
 
+    # ------------------------------------------------------------------ #
+    # VWAP                                                                 #
+    # ------------------------------------------------------------------ #
     def _vwap_now(self, snap):
-        """Lookahead-safe session VWAP at the current second. Built once per day
-        and cached; vwap[i] uses only rows 0..i."""
         c = self.context
         if "vwap_arr" not in c.data:
             c["vwap_arr"] = self._build_vwap(snap._feed)
         v = c["vwap_arr"][snap.i]
-        return float(v) if v == v else float(snap.spot)    # NaN guard -> spot
+        return float(v) if v == v else float(snap.spot)
 
     def _build_vwap(self, feed):
-        """sum(spot*vol)/sum(vol) cumulatively when a usable volume column is
-        loaded; otherwise a session running mean of spot (TWAP). Both are pure
-        prefix sums, so value at i never depends on rows after i."""
-        sp = np.asarray(feed.spot, dtype=float)
-        n  = len(sp)
-
+        sp  = np.asarray(feed.spot, dtype=float)
+        n   = len(sp)
         vol = feed.arrays.get(self.volume_field) if self.vwap_use_volume else None
         if vol is not None:
             vol = np.asarray(vol, dtype=float).reshape(-1)
             vol = vol if vol.shape[0] == n else None
-
         if vol is not None and np.nansum(vol) > 0:
-            if self.volume_is_cumulative:                  # running total -> per-second turnover
+            if self.volume_is_cumulative:
                 per = np.diff(vol, prepend=vol[:1])
-                vol = np.where(per < 0, 0.0, per)          # ignore resets/rollbacks
+                vol = np.where(per < 0, 0.0, per)
             w   = np.where(np.isnan(vol), 0.0, vol)
-            p   = np.where(np.isnan(sp), 0.0, sp)
+            p   = np.where(np.isnan(sp),  0.0, sp)
             num = np.cumsum(p * w)
             den = np.cumsum(w)
             return np.where(den > 0, num / np.maximum(den, 1e-12), np.nan)
-
-        # fallback: session running mean of spot (TWAP == VWAP under uniform volume)
         valid = ~np.isnan(sp)
         csum  = np.nancumsum(sp)
         ccnt  = np.cumsum(valid)
         return np.where(ccnt > 0, csum / np.maximum(ccnt, 1), np.nan)
 
     # ------------------------------------------------------------------ #
-    # alphas — computed every (non-executing) second                      #
+    # Alphas                                                               #
     # ------------------------------------------------------------------ #
     def compute_alphas(self, snap):
-        c   = self.context
-        sec = snap.i
+        c    = self.context
+        sec  = snap.i
         spot = snap.spot
-        bars_left = (len(snap._feed.ts) - 1) - sec     # seconds until this day's last bar
 
-        # --- the two headline alphas ---
+        # record starting equity once (day PnL = equity - starting_equity)
+        if c["starting_equity"] is None:
+            c["starting_equity"] = self.broker.portfolio.equity(snap)
+
         vwap     = self._vwap_now(snap)
         dev_bps  = (spot - vwap) / vwap * 1e4 if vwap else 0.0
         h        = snap.spot_hist(self.range_win)
         range_bps = (float(h.max()) - float(h.min())) / spot * 1e4 if len(h) else 0.0
 
-        # --- candidate strikes for every regime, off the STABLY quoted ladder ---
+        # range over just the last group_interval (for tight-add gate)
+        h_win = snap.spot_hist(self.group_interval)
+        range_win_bps = (float(h_win.max()) - float(h_win.min())) / spot * 1e4 if len(h_win) else 0.0
+
         atm    = snap.atm_strike(quoted_only=True)
         ladder = self._stable_ladder(snap)
-        c1_ce, c1_pe = self._offset(ladder, atm, +1), self._offset(ladder, atm, -3)   # regime 1
-        c2_ce, c2_pe = self._offset(ladder, atm, +3), self._offset(ladder, atm, -1)   # regime 2
-        t_ce,  t_pe  = self._bracket(ladder, spot)                                     # regime 3
+        c1_ce, c1_pe = self._offset(ladder, atm, +1), self._offset(ladder, atm, -3)
+        c2_ce, c2_pe = self._offset(ladder, atm, +3), self._offset(ladder, atm, -1)
+        t_ce,  t_pe  = self._bracket(ladder, spot)
 
-        # per-regime tradability: BOTH legs (the exact option type we'd sell) must be
-        # persistently quoted, so the slice can't fire into a strike with no quote.
         def _ok(ce, pe):
             return 1.0 if (self._leg_stable(snap, ce, "CE")
                            and self._leg_stable(snap, pe, "PE")) else 0.0
         c1_ok, c2_ok = _ok(c1_ce, c1_pe), _ok(c2_ce, c2_pe)
         t_ok         = _ok(t_ce, t_pe)
 
-        # locked skew legs (pyramid adds re-check these every group)
         skew_legs_ok = 1.0
         if c.get("skew_ce") is not None:
             skew_legs_ok = 1.0 if (self._leg_stable(snap, c["skew_ce"], "CE")
                                    and self._leg_stable(snap, c["skew_pe"], "PE")) else 0.0
+        tight_legs_ok = 1.0
+        if c.get("tight_ce") is not None:
+            tight_legs_ok = 1.0 if (self._leg_stable(snap, c["tight_ce"], "CE")
+                                    and self._leg_stable(snap, c["tight_pe"], "PE")) else 0.0
 
-        # --- book state the guards/states need (no snap is passed to them) ---
         pf       = self.broker.portfolio
         upnl     = pf.unrealized_pnl(snap)
-        notional = self._position_notional(snap)
+        margin   = self._margin_used()
 
-        # track the credit anchor (peak short notional) and the profit peak while in a skew
-        if c.get("episode") == "skew":
-            c["credit"]    = max(c.get("credit", 0.0), notional)
+        if c.get("episode") in ("skew", "tight"):
             c["peak_upnl"] = max(c.get("peak_upnl", upnl), upnl)
 
-        # stash scalars for on_enter hooks (which only receive ctx)
-        c["now_sec"] = sec
-        c["upnl"]    = upnl
+        risk_reason = self._risk_reason(c, upnl, margin)
+
+        # day PnL = net equity change since session open
+        day_pnl      = pf.equity(snap) - c["starting_equity"]
+        day_stop_hit = day_pnl <= -(self.day_stop_frac * self._total_day_margin())
+
+        c["now_sec"]      = sec
+        c["now_spot"]     = spot
+        c["now_range_bps"]= range_bps
+        c["upnl"]         = upnl
 
         return {
             "sec": sec, "spot": spot, "vwap": round(vwap, 4),
-            "bars_left": bars_left,
             "dev_bps": dev_bps, "range_bps": range_bps,
-            "atm": atm, "upnl": upnl, "notional": notional,
+            "range_win_bps": range_win_bps,
+            "risk_reason": risk_reason,
+            "day_stop_hit": float(day_stop_hit),
+            "day_pnl": day_pnl,
+            "atm": atm, "upnl": upnl, "margin": margin,
             "group": float(c.get("group", 0)),
             "c1_ce": c1_ce, "c1_pe": c1_pe, "c2_ce": c2_ce, "c2_pe": c2_pe,
             "t_ce": t_ce, "t_pe": t_pe,
             "c1_ok": c1_ok, "c2_ok": c2_ok, "t_ok": t_ok,
-            "skew_legs_ok": skew_legs_ok,
+            "skew_legs_ok": skew_legs_ok, "tight_legs_ok": tight_legs_ok,
         }
 
+    # ------------------------------------------------------------------ #
+    # Risk helpers                                                         #
+    # ------------------------------------------------------------------ #
+    def _risk_reason(self, c, upnl, margin):
+        """Check per-trade stops. Anchored to MARGIN (margin currently deployed),
+        not credit, so the threshold scales with actual position size."""
+        if margin <= 0.0:
+            return ""
+        # profit target
+        pt = self.profit_target if self.profit_target is not None \
+             else self.profit_take_frac * margin
+        if upnl >= pt:
+            return "profit_take"
+        # fixed stop-loss
+        sl = self.stop_loss_abs if self.stop_loss_abs is not None \
+             else self.stop_loss_frac * margin
+        if upnl <= -sl:
+            return "stop_loss"
+        # trailing: arms once up trail_arm_frac * margin, then gives back trail_frac * margin
+        peak = c.get("peak_upnl", upnl)
+        if peak >= self.trail_arm_frac * margin:
+            give = self.trail_stop if self.trail_stop is not None \
+                   else self.trail_frac * margin
+            if upnl <= peak - give:
+                return "trailing"
+        return ""
+
     def _position_notional(self, snap):
-        """|mid * lots * lot_size| summed over open legs — the short's market value."""
         pf, total = self.broker.portfolio, 0.0
         for (strike, opt_type), pos in pf.positions.items():
             if pos.lots == 0:
@@ -443,68 +502,95 @@ class VwapSkewStrangleNoFallback(StateMachineStrategy):
         return total
 
     # ------------------------------------------------------------------ #
-    # session-room helpers                                                #
+    # Room helpers                                                         #
     # ------------------------------------------------------------------ #
-    # session-room checks use the day's ACTUAL remaining bars (from the feed), not a
-    # fixed session_len guess — so a position never outlives the day. Each also refuses
-    # to open inside the EOD buffer, so we never open something we'd instantly flatten.
-    def _room_skew(self, a):   return a["bars_left"] >= self.skew_max_hold and a["bars_left"] > self.eod_buffer
-    def _room_tight(self, a):  return a["bars_left"] >= self.tight_hold    and a["bars_left"] > self.eod_buffer
+    def _room_skew(self, a):  return a["sec"] <= 23400 - self.skew_max_hold
+    def _room_tight(self, a): return a["sec"] <= 23400 - self.tight_hold
 
     # ------------------------------------------------------------------ #
-    # named guards (ledger-visible: the `signal` column records which fired)
+    # Guards                                                               #
     # ------------------------------------------------------------------ #
-    # --- WAIT: regime selection (priority = insertion order) ---
+
+    # --- daily stop (highest priority everywhere) ---
+    def guard_day_stop(self, a, c):
+        return bool(a["day_stop_hit"]) and bool(c.get("open_legs"))
+
+    # --- WAIT: entry gates ---
     def guard_above_vwap(self, a, c):
-        return a["dev_bps"] >= self.dev_bps_thresh and a["c1_ok"] > 0 and self._room_skew(a)
+        return (not a["day_stop_hit"] and
+                a["dev_bps"] >= self.dev_bps_thresh and
+                a["c1_ok"] > 0 and self._room_skew(a))
 
     def guard_below_vwap(self, a, c):
-        return a["dev_bps"] <= -self.dev_bps_thresh and a["c2_ok"] > 0 and self._room_skew(a)
+        return (not a["day_stop_hit"] and
+                a["dev_bps"] <= -self.dev_bps_thresh and
+                a["c2_ok"] > 0 and self._room_skew(a))
 
     def guard_calm_range(self, a, c):
-        return a["range_bps"] < self.range_bps_max and a["t_ok"] > 0 and self._room_tight(a)
+        return (not a["day_stop_hit"] and
+                a["range_bps"] < self.range_bps_max and
+                a["t_ok"] > 0 and self._room_tight(a))
 
-    # --- pyramid plumbing ---
+    # --- skew pyramid ---
     def guard_always_hold(self, a, c):
-        return True                                        # SKEW_ADD -> SKEW_HOLD next tick
+        return True
 
     def guard_skew_add(self, a, c):
-        return (c.get("group", 0) < self.n_groups
-                and a["sec"] - c.get("window_start_sec", a["sec"]) >= self.group_interval
-                and a["upnl"] - c.get("window_start_upnl", 0.0) > 0.0
-                and a["skew_legs_ok"] > 0)                 # locked strikes still tradable
+        """Add next group if: interval elapsed, spot still moved in our direction,
+        and locked strikes still quoted."""
+        if c.get("group", 0) >= self.n_groups:
+            return False
+        if a["sec"] - c.get("window_start_sec", a["sec"]) < self.group_interval:
+            return False
+        if a["skew_legs_ok"] <= 0:
+            return False
+        # direction gate: for above_vwap (side=="above") spot must still be >= window-start spot
+        side = c.get("skew_side", "above")
+        ws   = c.get("window_start_spot", a["spot"])
+        return a["spot"] >= ws if side == "above" else a["spot"] <= ws
 
     def guard_skew_freeze(self, a, c):
-        # 30s window elapsed but we won't (or can't) add: unprofitable window OR a
-        # locked leg has gone illiquid. Freezing here avoids firing into a dead quote.
-        if not (c.get("group", 0) < self.n_groups
-                and a["sec"] - c.get("window_start_sec", a["sec"]) >= self.group_interval):
+        """Freeze if interval elapsed but the direction gate or liquidity gate fails."""
+        if c.get("group", 0) >= self.n_groups:
             return False
-        profitable = a["upnl"] - c.get("window_start_upnl", 0.0) > 0.0
-        return (not profitable) or (a["skew_legs_ok"] <= 0)
-
-    def guard_skew_exit(self, a, c):
-        """Trailing stop OR profit limit OR 20-min max-hold (from the first slice)."""
-        if c.get("episode") != "skew":
+        if a["sec"] - c.get("window_start_sec", a["sec"]) < self.group_interval:
             return False
-        sec, upnl = a["sec"], a["upnl"]
-        if sec - c.get("entry_sec", sec) >= self.skew_max_hold:        # max-hold
-            return True
-        credit = c.get("credit", 0.0)
-        if credit > 0.0:
-            target = self.profit_target if self.profit_target is not None else self.profit_take_frac * credit
-            if upnl >= target:                                          # profit limit
-                return True
-            trail = self.trail_stop if self.trail_stop is not None else self.trail_frac * credit
-            peak  = c.get("peak_upnl", upnl)
-            if upnl < peak and upnl <= peak - trail:                    # trailing stop
-                return True
-        return False
+        # freeze if would NOT add (direction reversed OR illiquid)
+        side = c.get("skew_side", "above")
+        ws   = c.get("window_start_spot", a["spot"])
+        direction_ok = a["spot"] >= ws if side == "above" else a["spot"] <= ws
+        return (not direction_ok) or (a["skew_legs_ok"] <= 0)
 
-    # --- TIGHT (regime 3) ---
+    def guard_skew_maxhold(self, a, c):
+        return (c.get("episode") == "skew" and
+                a["sec"] - c.get("entry_sec", a["sec"]) >= self.skew_max_hold)
+
+    # --- tight pyramid ---
+    def guard_tight_add(self, a, c):
+        """Add next tight group if: interval elapsed, range is still calm (< max),
+        and locked strikes still quoted."""
+        if c.get("group", 0) >= self.n_groups:
+            return False
+        if a["sec"] - c.get("window_start_sec", a["sec"]) < self.group_interval:
+            return False
+        if a["tight_legs_ok"] <= 0:
+            return False
+        # calm gate: range over the last group_interval must still be below the ceiling
+        return a["range_win_bps"] < self.range_bps_max
+
+    def guard_tight_freeze(self, a, c):
+        """Freeze tight pyramid if interval elapsed but calm gate or liquidity gate fails."""
+        if c.get("group", 0) >= self.n_groups:
+            return False
+        if a["sec"] - c.get("window_start_sec", a["sec"]) < self.group_interval:
+            return False
+        return a["range_win_bps"] >= self.range_bps_max or a["tight_legs_ok"] <= 0
+
     def guard_tight_done(self, a, c):
-        return a["sec"] - c.get("entry_sec", a["sec"]) >= self.tight_hold
+        return (c.get("episode") == "tight" and
+                a["sec"] - c.get("entry_sec", a["sec"]) >= self.tight_hold)
 
-    # --- end-of-day: flatten ANY open position within eod_buffer of the close ---
-    def guard_eod_flat(self, a, c):
-        return bool(c.get("open_legs")) and a["bars_left"] <= self.eod_buffer
+    # --- risk exits (shared by skew and tight) ---
+    def guard_profit_take(self, a, c): return a.get("risk_reason") == "profit_take"
+    def guard_stop_loss(self, a, c):   return a.get("risk_reason") == "stop_loss"
+    def guard_trailing(self, a, c):    return a.get("risk_reason") == "trailing"

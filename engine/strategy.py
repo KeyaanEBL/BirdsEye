@@ -53,9 +53,8 @@ class State:
 
 class StateMachineStrategy:
     states      : Dict[str, State] = {}
-    slice_lots  : float = 1.0
-    pause       : int   = 0
     min_history : int   = 0                                 # warm-up: skip ticks until enough history
+    max_lots    : float = 1.0
 
     def __init__(self, initial_state, broker, name="", context=None):
         self.state      = initial_state
@@ -72,7 +71,7 @@ class StateMachineStrategy:
             return
         
         if self._executing is not None:                     # execution IS a state
-            self._executing.tick(snap, self.broker, self.slice_lots, self.pause)
+            self._executing.tick(snap, self.broker)
             if self._executing.is_done():
                 dest            = self._executing.dest
                 self._executing = None

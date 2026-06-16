@@ -15,13 +15,6 @@ def _eq(curve):
     return ts, eq
 
 
-def max_drawdown(curve: EquityCurve) -> float:
-    _, eq = _eq(curve)
-    if len(eq) == 0: return 0.0
-    peak = np.maximum.accumulate(eq)
-    return float((eq - peak).min())
-
-
 def total_return(curve: EquityCurve) -> float:
     _, eq = _eq(curve)
     return float(eq[-1] - eq[0]) if len(eq) else 0.0
@@ -43,33 +36,56 @@ def daily_stats(day_pnls: List[float]) -> Dict[str, float]:
         "avg_loss":     float(dn.mean()) if len(dn) else 0.0,
         "best_day":     float(a.max()),
         "worst_day":    float(a.min()),
-        "win_rate":     float(len(up) / len(a)),
     }
 
 
-def cagr(day_pnls, capital, periods_per_year=252):
-    r      = np.array(day_pnls) / capital
-    growth = np.prod(1.0 + r)
-    
-    if growth <= 0: return -1.0
-    return float(growth ** (periods_per_year / len(r)) - 1.0)
+def max_drawdown(day_pnls_net  : List[float],
+                 day_pnls_gross: List[float],
+                 margin_per_lot: float,
+                 max_lots      : float) -> Tuple[float, float]:
+    """Max drawdown as % of deployed margin, gross and net separately."""
+    margin = margin_per_lot * max_lots
+    if margin == 0:
+        return 0.0, 0.0
+
+    def _dd(pnls):
+        cs   = np.cumsum(pnls)
+        peak = np.maximum.accumulate(cs)
+        return float((peak - cs).max()) * 100 / margin
+
+    return _dd(day_pnls_gross), _dd(day_pnls_net)
 
 
-def max_drawdown_pct(day_pnls, capital):
-    eq   = capital * np.cumprod(1.0 + np.array(day_pnls) / capital)
-    peak = np.maximum.accumulate(eq)
-    return float(((eq - peak) / peak).min())
+def cagr(day_pnls         : List[float],
+         total_costs      : float,
+         margin_per_lot   : float,
+         max_lots         : float,
+         periods_per_year : int = 252) -> Tuple[float, float]:
+    """(total_pnl * periods_per_year) / (margin * n_days), gross and net."""
+    n      = len(day_pnls)
+    margin = margin_per_lot * max_lots
+    if n == 0 or margin == 0:
+        return 0.0, 0.0
+    net_pnl   = sum(day_pnls)
+    gross_pnl = net_pnl + total_costs
+    denom     = margin * n
+    return (float(gross_pnl * periods_per_year / denom) * 100,
+            float(net_pnl   * periods_per_year / denom) * 100)
 
 
-def calmar(day_pnls, capital, periods_per_year=252):    # classic: CAGR / |maxDD%|
-    dd = abs(max_drawdown_pct(day_pnls, capital))
-    return float("nan") if dd == 0 else cagr(day_pnls, capital, periods_per_year) / dd
+def calmar(cagr_gross: float,
+           cagr_net  : float,
+           dd_gross  : float,
+           dd_net    : float) -> Tuple[float, float]:
+    """cagr / |maxDD| — pass already-computed values to avoid recomputing."""
+    calmar_g = cagr_gross / dd_gross if dd_gross != 0 else float("nan")
+    calmar_n = cagr_net   / dd_net   if dd_net   != 0 else float("nan")
+    return calmar_g, calmar_n
 
 
-def churn(total_notional, capital, n_days):
-    """Capital cycles/day: total traded value / (capital * n_days).
-    churn=2 -> an average day trades 2x the capital in and out."""
-    return float(total_notional / (capital * n_days))
+def churn(total_traded_lots: float) -> float:
+    """Total lots traded / 2 — one complete open+close = 1."""
+    return float(total_traded_lots / 2)
 
 
 def cost_stats(Tradelog: Tradelog) -> Dict[str, float]:

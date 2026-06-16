@@ -53,7 +53,7 @@ class Tradelog:
         rows, alpha_rows = [], []
         for f in self.fills:
             rows.append({
-                "timestamp"   : f.ts,
+                "timestamp"   : pd.Timestamp(f.ts, tz="UTC").tz_convert("America/New_York").strftime("%H:%M:%S"),
                 "strike"      : f.strike,
                 "opt_type"    : f.opt_type,
                 "action"      : f.action,

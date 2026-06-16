@@ -7,13 +7,38 @@ import numpy as np
 EquityCurve = List[Tuple[int, float]]
 
 
-def plot_equity(curve, ax=None, label=None):
+def _plot_cum(ax, series, title, color):
+    """One cumulative-P&L curve on `ax` with its drawdown (area below the running
+    peak) shaded red. X axis is days, with no tick labels."""
+    n = len(series)
+    x = np.arange(n)
+    ax.plot(x, series, color=color, lw=1.3, label=title)
+    if n:
+        peak = np.maximum.accumulate(series)
+        ax.fill_between(x, series, peak, where=series < peak, color="tab:red",
+                        alpha=0.25, interpolate=True, label="drawdown")
+    ax.axhline(0, color="black", lw=0.6, alpha=0.5)
+    ax.set_title(title); ax.set_ylabel("cum P&L ($)")
+    ax.set_xticks([])                              # no labels on the x axis
+    ax.legend(loc="best", fontsize=8)
+
+
+def plot_equity(summary, axes=None):
+    """Day-by-day cumulative P&L across the whole run, built from the per-day
+    summary table (Results.summary, or a Results). TWO SEPARATE plots, each with
+    its own drawdown shaded red: (1) net($) — after costs, (2) gross($) — mid-only,
+    no transaction/spread cost. Both cumulative-summed over days; x axis is days
+    (no tick labels)."""
     import matplotlib.pyplot as plt
-    ts = np.arange(len(curve)); eq = np.array([e for _, e in curve], dtype=float)
-    ax = ax or plt.subplots(figsize=(11, 4))[1]
-    ax.plot(ts, eq, label=label); ax.set_title("Equity"); ax.set_xlabel("tick"); ax.set_ylabel("equity")
-    if label: ax.legend()
-    return ax
+    df = summary.summary if hasattr(summary, "summary") else summary
+    net   = np.asarray(df["net($)"],   dtype=float).cumsum()
+    gross = np.asarray(df["gross($)"], dtype=float).cumsum()
+    if axes is None:
+        _, axes = plt.subplots(2, 1, figsize=(11, 7))
+    _plot_cum(axes[0], net,   "net P&L (after costs)",   "tab:blue")
+    _plot_cum(axes[1], gross, "mid-only P&L (no costs)", "tab:green")
+    axes[1].set_xlabel("days")
+    return axes
 
 
 def plot_drawdown(curve, ax=None):
