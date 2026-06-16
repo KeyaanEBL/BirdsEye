@@ -55,16 +55,19 @@ class Short(State):
     }
 
     def target(self, alphas, ctx):
-        atm  = alphas["atm"]
+        ce_k = alphas["ce_strike"]
+        pe_k = alphas["pe_strike"]
         lots = ctx["strat"].lots
-        wing = ctx["strat"].wing_strikes          # OTM strikes for strangle legs
-        ctx["short_atm"] = atm
-        ctx["entry_premium"] = alphas["straddle_mid"]
+        ctx["short_ce"]   = ce_k
+        ctx["short_pe"]   = pe_k
+        ctx["entry_prem"] = alphas["ce_mid"] + alphas["pe_mid"]
         return Order(
             name="short_strangle",
             legs=[
-                OrderLeg(wing["CE"], "CE", lots=lots, action="SELL"),
-                OrderLeg(wing["PE"], "PE", lots=lots, action="SELL"),
+                OrderLeg(ce_k, "CE", lots=lots, action="SELL",
+                         slice_lots=lots, pause=0),
+                OrderLeg(pe_k, "PE", lots=lots, action="SELL",
+                         slice_lots=lots, pause=0),
             ],
             reason=Reason(state="SHORT"),
         )
@@ -74,81 +77,108 @@ class Short(State):
 
 
 class RangeShortStrangle(StateMachineStrategy):
-    states     = {"WAIT": Wait(), "SHORT": Short()}
-    slice_lots = 100
-    pause      = 0
+    states   = {"WAIT": Wait(), "SHORT": Short()}
+    max_lots = LOTS
+    # slice_lots and pause are NOT class-level — they live on each OrderLeg
 
-    def __init__(self, broker, lots=1, max_lots=None,
-                 range_win=600, decision_every=1200,
-                 hold=600, range_bps_max=15.0,
-                 wing_offset=50, stop_mult=2.0,
-                 session_len=23400):
-        self.lots            = lots
-        self.max_lots        = max_lots or lots       # caps margin calculation
-        self.range_win       = range_win
-        self.decision_every  = decision_every
-        self.hold            = hold
-        self.range_bps_max   = range_bps_max
-        self.wing_offset     = wing_offset            # OTM distance in strike points
-        self.stop_mult       = stop_mult
-        self.session_len     = session_len
-        self.min_history     = range_win              # warm-up: no decisions before this
+    def __init__(
+        self,
+        broker,
+        lots          = LOTS,
+        max_lots      = None,
+        range_win     = RANGE_WIN,
+        hold          = HOLD,
+        range_bps_max = RANGE_BPS_MAX,
+        min_dist_bps  = MIN_DIST_BPS,
+        stop_mult     = STOP_MULT,
+        skip_open     = SKIP_OPEN,
+        session_len   = SESSION_LEN,
+    ):
+        self.lots          = lots
+        self.max_lots      = max_lots if max_lots is not None else lots * 2
+        self.range_win     = range_win
+        self.hold          = hold
+        self.range_bps_max = range_bps_max
+        self.min_dist_bps  = min_dist_bps
+        self.stop_mult     = stop_mult
+        self.skip_open     = skip_open
+        self.session_len   = session_len
+        self.min_history   = range_win               # warm-up: no decisions before this
 
-        ctx = Context()
-        ctx["next_decision"] = decision_every
-        ctx["short_atm"]     = None
-        ctx["entry_sec"]     = 0
-        ctx["entry_premium"] = 0.0
+        ctx             = Context()
+        ctx["short_ce"] = None
+        ctx["short_pe"] = None
         super().__init__("WAIT", broker, name="range_short_strangle", context=ctx)
         ctx["strat"] = self
 
     # ---- named guards: documented, testable, ledger-visible ----
     def guard_calm_entry(self, a, c):
-        return (a["decision_now"]
+        return (a["sec"] >= self.skip_open
                 and a["range_bps"] < self.range_bps_max
+                and a["ce_strike"] is not None
+                and a["pe_strike"] is not None
                 and a["sec"] < self.session_len - self.hold)
 
-    def guard_stop_hit(self, a, c):
-        return a["straddle_mid"] > c["entry_premium"] * self.stop_mult
+    def guard_stop_triggered(self, a, c):
+        ep = c.get("entry_prem")
+        cp = a.get("current_prem")
+        if ep is None or cp is None or ep <= 0:
+            return False
+        return cp > self.stop_mult * ep
 
     def guard_hold_elapsed(self, a, c):
-        return a["sec"] - c["entry_sec"] >= self.hold
+        return a["sec"] - c.get("entry_sec", 0) >= self.hold
 
     # ---- alphas, computed every second -------------------------
     def compute_alphas(self, snap):
-        c   = self.context
-        sec = snap.i
-        atm = snap.atm_strike(quoted_only=True)
-
-        h   = snap.spot_hist(self.range_win)
-        rng = (h.max() - h.min()) / snap.spot * 1e4
-
-        decide = sec >= c["next_decision"]
-        if decide:
-            c["next_decision"] += self.decision_every
+        c    = self.context
+        sec  = snap.i
+        spot = snap.spot
         c["now_sec"] = sec
 
-        # OTM wing strikes for the strangle
-        wing = {"CE": atm + self.wing_offset, "PE": atm - self.wing_offset}
+        h   = snap.spot_hist(self.range_win)
+        rng = (h.max() - h.min()) / spot * 1e4
 
-        # current straddle mid at ATM (stop reference)
-        ce_mid = snap.mid_half(atm, "CE") * 2
-        pe_mid = snap.mid_half(atm, "PE") * 2
-        straddle_mid = ce_mid + pe_mid
+        strikes = snap._feed.strikes
+        thr     = self.min_dist_bps
+
+        def _quoted(s, opt_type):
+            try:
+                b, a = snap.quote(float(s), opt_type)
+                return np.isfinite(b) and np.isfinite(a)
+            except Exception:
+                return False
+
+        ce_k = next((float(s) for s in strikes
+                     if (s - spot) / spot * 1e4 >= thr and _quoted(s, "CE")), None)
+        pe_k = next((float(s) for s in strikes[::-1]
+                     if (spot - s) / spot * 1e4 >= thr and _quoted(s, "PE")), None)
+
+        ce_mid = pe_mid = np.nan
+        if ce_k is not None:
+            cb, ca = snap.quote(ce_k, "CE"); ce_mid = (cb + ca) / 2
+        if pe_k is not None:
+            pb, pa = snap.quote(pe_k, "PE"); pe_mid = (pb + pa) / 2
+
+        current_prem = None
+        if c.get("short_ce") is not None:
+            try:
+                cb, ca = snap.quote(c["short_ce"], "CE")
+                pb, pa = snap.quote(c["short_pe"], "PE")
+                current_prem = (cb + ca + pb + pa) / 2
+            except Exception:
+                pass
 
         return {
             "sec":          sec,
-            "spot":         snap.spot,
-            "atm":          atm,
+            "spot":         spot,
             "range_bps":    rng,
-            "decision_now": decide,
-            "straddle_mid": straddle_mid,
+            "ce_strike":    ce_k,
+            "pe_strike":    pe_k,
+            "ce_mid":       ce_mid,
+            "pe_mid":       pe_mid,
+            "current_prem": current_prem,
         }
-
-    @property
-    def wing_strikes(self):
-        return {"CE": self._last_atm + self.wing_offset,
-                "PE": self._last_atm - self.wing_offset}
 ```
 
 ### 2. Run it
@@ -217,11 +247,19 @@ Because guards are named, the **Tradelog records exactly which condition fired e
 WAIT --guard fires--> EXECUTING(order, dest=SHORT) --all lots filled--> SHORT
 ```
 
-While `EXECUTING`, the FSM evaluates no user transitions — a new intent must wait until the in-flight order is fully placed. The order is sliced at `slice_lots` per leg per tick with an optional `pause` between slices (both strategy-level attributes). If execution releases slices for 60 straight ticks with zero fills (an unquoted strike), it **raises loudly** naming the starving legs instead of silently eating the day.
+While `EXECUTING`, the FSM evaluates no user transitions — a new intent must wait until the in-flight order is fully placed. Each leg is worked independently according to its own `slice_lots` and `pause` — set these on the `OrderLeg`, not on the strategy class. If execution releases slices for 60 straight ticks with zero fills (an unquoted strike), it **raises loudly** naming the starving legs instead of silently eating the day.
 
 ### Orders are deltas
 
-An `Order` means *"trade these lots now"* — `lots` is always positive, direction lives in `action` (`"BUY"` / `"SELL"`). Flattening reads the live position once, through one helper:
+An `Order` means *"trade these lots now"* — `lots` is always positive, direction lives in `action` (`"BUY"` / `"SELL"`). Execution pacing is set **per leg** via `slice_lots` and `pause` on `OrderLeg`, not on the strategy:
+
+```python
+OrderLeg(strike, "CE", lots=10, action="SELL", slice_lots=10, pause=0)
+#                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+#                       how many lots to release per tick, and how long to wait between slices
+```
+
+Every leg in the same `Order` can have different pacing if needed. Flattening reads the live position once, through one helper:
 
 ```python
 self.close_legs([(strike, "CE"), (strike, "PE")], reason="square off")
