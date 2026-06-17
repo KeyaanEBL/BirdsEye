@@ -170,7 +170,8 @@ class LogRegRangeStraddle(StateMachineStrategy):
                  hold_max=3600,
                  min_flat_sec=900,   # cooldown after any exit before re-entry (15 min)
                  min_hold_sec=900,   # minimum hold before regime_flip can fire (15 min)
-                 eod_buffer=600):    # close when <= this many seconds remain in the day
+                 eod_buffer=600,
+                 max_lots = 1):    # close when <= this many seconds remain in the day
         self.logreg         = logreg
         self.regime_config  = regime_config
         self.lots           = lots
@@ -185,6 +186,7 @@ class LogRegRangeStraddle(StateMachineStrategy):
         self.min_hold_sec   = min_hold_sec
         self.eod_buffer     = eod_buffer
         self.min_history    = HIST_SEC   # 30-min warm-up before any decisions
+        self.max_lots      = max_lots   
 
         # set session for the correct index so classify_core uses right market hours
         rc.SESSION = rcfg.session_dict(index)
