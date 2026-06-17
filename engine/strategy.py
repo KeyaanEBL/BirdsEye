@@ -54,7 +54,6 @@ class State:
 class StateMachineStrategy:
     states      : Dict[str, State] = {}
     min_history : int   = 0                                 # warm-up: skip ticks until enough history
-    max_lots    : float = 1.0
 
     def __init__(self, initial_state, broker, name="", context=None):
         self.state      = initial_state
@@ -62,7 +61,8 @@ class StateMachineStrategy:
         self.name       = name or type(self).__name__
         self.context    = context or Context()
         self._executing : Optional[Executing] = None        # Executing instance while an order works
-        self.perseclog  = PerSecLog()
+        self.perseclog    = PerSecLog()
+        self._guard_cache : dict = {}
         self.states[self.state].on_enter(self.context)
 
     def next(self, snap):
@@ -100,14 +100,19 @@ class StateMachineStrategy:
                     self.state = "EXECUTING"
                 break
     
-    def close_legs(self, keys, reason=""):
-        """Order that flattens the given (strike, opt_type) legs at current size."""
+    def close_legs(self, keys, reason="", slice_lots=1.0, pause=0):
         legs = []
         for key in keys:
             pos = self.broker.portfolio.positions.get(key)
             if pos is not None and pos.lots != 0:
-                legs.append(OrderLeg(key[0], key[1], lots = abs(pos.lots), action = "SELL" if pos.lots > 0 else "BUY"))
-        return Order(legs = legs, name = "close", reason = reason) if legs else None
+                legs.append(OrderLeg(
+                    key[0], key[1],
+                    lots       = abs(pos.lots),
+                    action     = "SELL" if pos.lots > 0 else "BUY",
+                    slice_lots = slice_lots,
+                    pause      = pause,
+                ))
+        return Order(legs=legs, name="close", reason=reason) if legs else None
     
     @staticmethod
     def _transition_items(state):
@@ -117,13 +122,15 @@ class StateMachineStrategy:
         return [(tr.guard, tr.dest) for tr in t]         # legacy [Transition] list
 
     def _resolve_guard(self, key):
-        """'stop_hit' -> (self.guard_stop_hit, 'stop_hit'); callable -> itself."""
-        if callable(key):
-            return key, getattr(key, "__name__", "guard")
-        return getattr(self, f"guard_{key}"), key
+        if key in self._guard_cache:
+            return self._guard_cache[key]
+        result = (key, getattr(key, "__name__", "guard")) if callable(key) \
+                else (getattr(self, f"guard_{key}"), key)
+        self._guard_cache[key] = result
+        return result
     
     def _log(self, snap, alphas):
-        row = {"timestamp": snap.ts, "spot": snap.spot, "atm": snap.atm_strike(), "state": self.state}
+        row = {"timestamp": snap.ts, "spot": snap.spot, "atm": snap.atm, "state": self.state}
         if alphas:
             row.update({k: v for k, v in alphas.items() if isinstance(v, (int, float))})
         self.perseclog.add(**row)

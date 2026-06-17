@@ -30,9 +30,12 @@ class Wait(State):
             return None
         ctx["short_ce"] = None
         ctx["short_pe"] = None
-        return ctx["strat"].close_legs(
+        strat = ctx["strat"]
+        return strat.close_legs(
             [(ce_k, "CE"), (pe_k, "PE")],
-            reason=Reason(state="WAIT", note="square off"),
+            reason      = Reason(state="WAIT", note="square off"),
+            slice_lots  = strat.lots,
+            pause       = 0,
         )
 
 
@@ -64,7 +67,6 @@ class Short(State):
 
 class RangeShortStrangle(StateMachineStrategy):
     states     = {"WAIT": Wait(), "SHORT": Short()}
-    max_lots   = LOTS
     # slice_lots and pause removed — now per OrderLeg
 
     def __init__(
@@ -80,7 +82,6 @@ class RangeShortStrangle(StateMachineStrategy):
         session_len   = SESSION_LEN,
         # max_lots: max total lots open at once — used for churn.
         # defaults to 2 * lots (two legs of a strangle).
-        max_lots      = None,
     ):
         self.lots          = lots
         self.range_win     = range_win
@@ -90,7 +91,6 @@ class RangeShortStrangle(StateMachineStrategy):
         self.stop_mult     = stop_mult
         self.skip_open     = skip_open
         self.session_len   = session_len
-        self.max_lots      = max_lots if max_lots is not None else lots * 2
         self.min_history   = range_win
 
         ctx             = Context()
@@ -122,49 +122,44 @@ class RangeShortStrangle(StateMachineStrategy):
         spot = snap.spot
         c["now_sec"] = sec
 
-        h   = snap.spot_hist(self.range_win)
-        rng = (h.max() - h.min()) / spot * 1e4
+        h       = snap.spot_hist(self.range_win)
+        rng_bps = (h.max() - h.min()) / spot * 1e4
 
         strikes = snap._feed.strikes
+        thr     = self.min_dist_bps
 
-        def _quoted(s, opt_type):
-            try:
-                b, a = snap.quote(float(s), opt_type)
-                return np.isfinite(b) and np.isfinite(a)
-            except Exception:
-                return False
+        ce_k = ce_mid = None
+        for s in strikes:
+            if (s - spot) / spot * 1e4 < thr:
+                continue
+            q = snap.quote(float(s), "CE")
+            if q is None:
+                continue
+            ce_k, ce_mid = float(s), 0.5 * (q[0] + q[1])
+            break
 
-        thr  = self.min_dist_bps
-        ce_k = next((float(s) for s in strikes       if (s    - spot) / spot * 1e4 >= thr and _quoted(s, "CE")), None)
-        pe_k = next((float(s) for s in strikes[::-1] if (spot - s   ) / spot * 1e4 >= thr and _quoted(s, "PE")), None)
-
-        ce_mid = pe_mid = np.nan
-        if ce_k is not None:
-            try:
-                cb, ca = snap.quote(ce_k, "CE")
-                ce_mid = (cb + ca) / 2
-            except Exception:
-                pass
-        if pe_k is not None:
-            try:
-                pb, pa = snap.quote(pe_k, "PE")
-                pe_mid = (pb + pa) / 2
-            except Exception:
-                pass
+        pe_k = pe_mid = None
+        for s in strikes[::-1]:
+            if (spot - s) / spot * 1e4 < thr:
+                continue
+            q = snap.quote(float(s), "PE")
+            if q is None:
+                continue
+            pe_k, pe_mid = float(s), 0.5 * (q[0] + q[1])
+            break
 
         current_prem = None
-        if c.get("short_ce") is not None:
-            try:
-                cb, ca = snap.quote(c["short_ce"], "CE")
-                pb, pa = snap.quote(c["short_pe"], "PE")
-                current_prem = (cb + ca + pb + pa) / 2
-            except Exception:
-                pass
+        sce, spe = c.get("short_ce"), c.get("short_pe")
+        if sce is not None and spe is not None:
+            qc = snap.quote(sce, "CE")
+            qp = snap.quote(spe, "PE")
+            if qc is not None and qp is not None:
+                current_prem = 0.5 * (qc[0] + qc[1] + qp[0] + qp[1])
 
         return {
             "sec":          sec,
             "spot":         spot,
-            "range_bps":    rng,
+            "range_bps":    rng_bps,
             "ce_strike":    ce_k,
             "pe_strike":    pe_k,
             "ce_mid":       ce_mid,

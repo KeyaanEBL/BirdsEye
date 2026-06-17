@@ -7,7 +7,7 @@ the Tradelog downstream, so it stays pure storage: append + read, no logic.
 
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Dict
 import pandas as pd
 
 from .orders import Reason
@@ -75,12 +75,18 @@ class Tradelog:
  
  
 class PerSecLog:
-    """Per-second record: ts, i, spot, atm, FSM state, and every alpha value."""
     def __init__(self):
-        self.rows: List[dict] = []
- 
+        self._cols: Dict[str, List] = {}
+
     def add(self, **row) -> None:
-        self.rows.append(row)
- 
+        for k, v in row.items():
+            self._cols.setdefault(k, []).append(v)
+
     def as_dataframe(self) -> pd.DataFrame:
-        return pd.DataFrame(self.rows).round(2)
+        if not self._cols:
+            return pd.DataFrame()
+        max_len = max(len(v) for v in self._cols.values())
+        return pd.DataFrame({
+            k: [None] * (max_len - len(v)) + v
+            for k, v in self._cols.items()
+        }).round(2)

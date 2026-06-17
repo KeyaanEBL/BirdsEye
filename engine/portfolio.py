@@ -23,12 +23,15 @@ class Position:
 
 
 class Portfolio:
-    def __init__(self, lot_size: float = 1.0, starting_cash: float = 0.0):
-        self.lot_size     = lot_size                                    # PLACEHOLDER-driven (from config)
-        self.cash         = starting_cash
+    def __init__(self, lot_size: float = 1.0, max_lots: float = 1.0):
+        self.lot_size     = lot_size
+        self.max_lots     = max_lots
+        self.cash         = 0.0
         self.realized_pnl = 0.0
         self.positions    : Dict[Tuple[float, str], Position] = {}
-        self.equity_curve : List[Tuple[int, float]] = []                # (ts, equity)
+        self._active_keys  : set = set()
+        self._equity_values  : List[float] = []
+        self._exposure_values: List[float] = []
 
     # ---- fills -------------------------------------------------------------
     def apply_fill(self, fill) -> None:
@@ -36,7 +39,15 @@ class Portfolio:
         and debit costs from cash. `fill` is a Tradelog.Fill."""
         key = (fill.strike, fill.opt_type)
         pos = self.positions.setdefault(key, Position())
-        old_lots, new_lots = pos.lots, pos.lots + fill.signed_lots
+        new_lots = pos.lots + fill.signed_lots
+
+        ot         = fill.opt_type.lower()
+        type_total = sum(abs(self.positions[k].lots) for k in self._active_keys if k[1].lower() == ot)
+        projected  = type_total - abs(pos.lots) + abs(new_lots)
+        if projected > self.max_lots:
+            raise RuntimeError(f"max_lots exceeded: {fill.opt_type} projected={projected:.1f} limit={self.max_lots}")
+
+        old_lots = pos.lots
 
         # realized PnL when reducing/closing (sign change or shrink toward 0)
         if old_lots != 0 and (old_lots > 0) != (fill.signed_lots > 0):
@@ -51,22 +62,22 @@ class Portfolio:
         elif (new_lots > 0) != (old_lots > 0) and new_lots != 0:        # flipped past zero
             pos.avg_entry = fill.fill_price
 
+        # frictions hit cash immediately at fill
         pos.lots = new_lots
         if new_lots == 0:
             pos.avg_entry = 0.0
-
-        # frictions hit cash immediately at fill
-        self.cash -= fill.execution_cost                                
+            self._active_keys.discard(key)
+        else:
+            self._active_keys.add(key)
+        self.cash -= fill.execution_cost                              
 
     # ---- marking -----------------------------------------------------------
     def unrealized_pnl(self, snap: MarketSnapshot) -> float:
         total = 0.0
-        for (strike, opt_type), pos in self.positions.items():
-            if pos.lots == 0:
-                continue
-            mh = snap.mid_and_half_spread(strike, opt_type)
-            if mh is None:
-                continue
+        for key in self._active_keys:
+            pos = self.positions[key]
+            mh  = snap.mid_and_half_spread(key[0], key[1])
+            if mh is None: continue
             mid, _ = mh
             total += (mid - pos.avg_entry) * pos.lots * self.lot_size
         return total
@@ -76,5 +87,10 @@ class Portfolio:
 
     def mark_to_market(self, snap: MarketSnapshot) -> float:
         eq = self.equity(snap)
-        self.equity_curve.append((snap.ts, eq))
+        self._equity_values.append(eq)
         return eq
+    
+    def record_exposure(self, snap: MarketSnapshot) -> float:
+        total = sum(abs(self.positions[k].lots) for k in self._active_keys)
+        self._exposure_values.append(total)
+        return total

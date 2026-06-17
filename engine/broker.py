@@ -1,6 +1,5 @@
 """
 broker.py — turns an Order into recorded reality: fills, costs, Tradelog, book.
-
 execute(order, snapshot): for each leg, read the quote, fill at the CROSSED side
 (buy -> ask, sell -> bid), compute the three costs, write a Fill to the Tradelog,
 and apply it to the portfolio. Fills the whole order at once for now — the
@@ -10,7 +9,6 @@ with no change needed here.
 
 
 from typing import List
-
 from .snapshot import MarketSnapshot
 from .orders import Order, OrderLeg, Reason
 from .costs import CostModel
@@ -19,10 +17,10 @@ from .portfolio import Portfolio
 
 
 class Broker:
-    def __init__(self, portfolio: Portfolio, costs: CostModel, Tradelog: Tradelog = None):
+    def __init__(self, portfolio: Portfolio, costs: CostModel, tradelog: Tradelog = None):
         self.portfolio = portfolio
         self.costs     = costs
-        self.Tradelog    = Tradelog or Tradelog()
+        self.tradelog  = tradelog or Tradelog()
 
     def execute(self, order: Order, snap: MarketSnapshot) -> List[Fill]:
         """Fill every leg of the order immediately at this second's quotes."""
@@ -33,8 +31,7 @@ class Broker:
                 continue
             mid, half_spread = mh
             costs = self.costs.execution_costs(half_spread, mid, leg.lots)
-            
-            fill = Fill(
+            fill  = Fill(
                 ts          = snap.ts,
                 strike      = leg.strike,
                 opt_type    = leg.opt_type,
@@ -46,15 +43,15 @@ class Broker:
                 spread_cost = costs["spread_cost"],
                 reason      = order.reason,
             )
-            
-            self.Tradelog.add(fill)
             self.portfolio.apply_fill(fill)
+            self.tradelog.add(fill)
             fills.append(fill)
         return fills
 
     def mark_to_market(self, snap: MarketSnapshot) -> float:
+        self.portfolio.record_exposure(snap)
         return self.portfolio.mark_to_market(snap)
-    
+
     def eod_square_off(self, snap) -> list:
         fills = []
         for (strike, opt_type), pos in self.portfolio.positions.items():

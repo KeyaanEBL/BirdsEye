@@ -98,3 +98,24 @@ def cost_stats(Tradelog: Tradelog) -> Dict[str, float]:
         "brokerage"   : float(df["brokerage"].sum()),
         "total_cost"  : float(df["cost"].sum()),
     }
+
+def time_in_market(exposure_curves: List[List[float]]) -> float:
+    if not exposure_curves: return 0.0
+    all_vals = np.concatenate([np.asarray(c, dtype=float) for c in exposure_curves])
+    return float((all_vals > 0).mean()) if len(all_vals) else 0.0
+
+
+def avg_hold_time(exposure_curves: List[List[float]]) -> float:
+    segments = []
+    for vals in exposure_curves:
+        a = np.asarray(vals, dtype=float)
+        if len(a) == 0: continue
+        pad         = np.empty(len(a) + 2, dtype=np.int8)
+        pad[0]      = pad[-1] = 0
+        pad[1:-1]   = (a > 0).astype(np.int8)
+        entries     = np.where((pad[:-1] == 0) & (pad[1:] != 0))[0]
+        exits       = np.where((pad[:-1] != 0) & (pad[1:] == 0))[0]
+        n           = min(len(entries), len(exits))
+        if n: segments.append(exits[:n] - entries[:n])
+    if not segments: return 0.0
+    return float(np.concatenate(segments).mean())
