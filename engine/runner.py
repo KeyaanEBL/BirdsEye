@@ -50,10 +50,9 @@ PERIODS_PER_YEAR: Dict[str, int] = {
 
 @dataclass
 class RunConfig:
-    """Single source of truth for run-level parameters shared by BirdsEye and Results."""
     lot_size        : float
-    starting_cash   : float
     margin_per_lot  : float
+    max_lots        : float
     periods_per_year: int
 
 
@@ -69,16 +68,17 @@ def _run_one_day(args):
 
     day = os.path.basename(path).split(".")[0]
     try:
-        feed = Feed.from_raw(path, index, fields=fields)     # raw /mnt -> arrays
+        feed = Feed.from_raw(path, index, fields=fields)
     except Exception as e:
         return day, None, None, None, None, f"load error: {e}"
 
-    pf    = Portfolio(lot_size=cfg.lot_size, starting_cash=cfg.starting_cash)
+    pf    = Portfolio(lot_size=cfg.lot_size, max_lots=cfg.max_lots)
     cm    = CostModel(lot_size=cfg.lot_size, **cost_kwargs)
     led   = Tradelog()
     br    = Broker(pf, cm, led)
     strat = strategy_cls(broker=br, **strategy_kwargs)
 
+    last_snap = None
     try:
         for snap in feed:
             strat.next(snap)
@@ -91,7 +91,7 @@ def _run_one_day(args):
         br.eod_square_off(last_snap)
         br.mark_to_market(last_snap)
 
-    raw_curve = np.array([e for _, e in pf.equity_curve], dtype=np.float64)
+    raw_curve     = np.asarray(pf._equity_values, dtype=np.float64)
     if curve_every > 1:
         idx = list(range(0, len(raw_curve), curve_every))
         if idx[-1] != len(raw_curve) - 1:
@@ -103,14 +103,16 @@ def _run_one_day(args):
         df = strat.perseclog.as_dataframe()
         perseclog_data = {col: df[col].to_numpy() for col in df.columns}
 
+    exposure_data = pf._exposure_values
+
     return (
         day,
         raw_curve,
         led,
-        float(raw_curve[-1] - cfg.starting_cash),
+        float(raw_curve[-1]),
         perseclog_data,
-        sum(abs(f.lots) for f in led.fills),   # total traded lots (raw, not /2)
-        getattr(strat, "max_lots", 1.0),
+        sum(abs(f.lots) for f in led.fills),
+        exposure_data,
     )
 
 
@@ -120,15 +122,15 @@ def _run_one_day(args):
 
 class Results:
     def __init__(self, days, curves, tradelogs, day_pnls, cfg: RunConfig,
-                 perseclogs=None, traded_lots_list=None, max_lots=None):
-        self.days         = days
-        self.curves       = curves
-        self.tradelogs    = tradelogs
-        self.day_pnls     = day_pnls
-        self.cfg          = cfg
-        self._perseclogs  = perseclogs or {}
-        self._traded_lots = traded_lots_list or []
-        self._max_lots    = max_lots or 1.0
+                 perseclogs=None, traded_lots_list=None, exposure_curves_list=None):
+        self.days             = days
+        self.curves           = curves
+        self.tradelogs        = tradelogs
+        self.day_pnls         = day_pnls
+        self.cfg              = cfg
+        self._perseclogs      = perseclogs or {}
+        self._traded_lots     = traded_lots_list or []
+        self._exposure_curves = exposure_curves_list or []
 
     # --- tables (cached — concat is expensive over many days) ---------------
 
@@ -178,27 +180,29 @@ class Results:
         day_costs_list = [self.tradelogs[d].total_costs for d in self.days]
         day_pnls_gross = [n + c for n, c in zip(self.day_pnls, day_costs_list)]
 
-        cagr_g, cagr_n   = analyzers.cagr(
+        cagr_g, cagr_n     = analyzers.cagr(
             self.day_pnls, total_costs,
-            cfg.margin_per_lot, self._max_lots, cfg.periods_per_year,
+            cfg.margin_per_lot, cfg.max_lots, cfg.periods_per_year,
         )
-        dd_g, dd_n       = analyzers.max_drawdown(
+        dd_g, dd_n         = analyzers.max_drawdown(
             self.day_pnls, day_pnls_gross,
-            cfg.margin_per_lot, self._max_lots,
+            cfg.margin_per_lot, cfg.max_lots,
         )
         calmar_g, calmar_n = analyzers.calmar(cagr_g, cagr_n, dd_g, dd_n)
 
         out = dict(analyzers.daily_stats(self.day_pnls))
         out.update({
-            "cagr_gross"    : cagr_g,
-            "maxDD_gross"   : dd_g,
-            "calmar_gross"  : calmar_g,
-            "cagr_net"      : cagr_n,
-            "maxDD_net"     : dd_n,
-            "calmar_net"    : calmar_n,
-            "n_fills"       : len(tl) if not tl.empty else 0,
-            "churn"         : analyzers.churn(total_lots, self._max_lots),
-            "total_costs"   : total_costs,
+            "cagr_gross"     : cagr_g,
+            "maxDD_gross"    : dd_g,
+            "calmar_gross"   : calmar_g,
+            "cagr_net"       : cagr_n,
+            "maxDD_net"      : dd_n,
+            "calmar_net"     : calmar_n,
+            "n_fills"        : len(tl) if not tl.empty else 0,
+            "churn"          : analyzers.churn(total_lots, cfg.max_lots),
+            "total_costs"    : total_costs,
+            "time_in_market" : analyzers.time_in_market(self._exposure_curves),
+            "avg_hold_time"  : analyzers.avg_hold_time(self._exposure_curves),
         })
         return {k: (round(v, 4) if isinstance(v, float) else v) for k, v in out.items()}
 
@@ -215,8 +219,8 @@ class BirdsEye:
                  strategy_kwargs   : Optional[dict]   = None,
                  fields            : Tuple[str, ...]  = DEFAULT_FIELDS,
                  lot_size          : float = 1.0,
-                 starting_cash     : float = 0.0,
-                 margin_per_lot    : float = 0.0,
+                 margin_per_lot    : float = 1.0,
+                 max_lots          : float = 1.0,
                  cost_kwargs       : Optional[dict]   = None,
                  n_workers         : Optional[int]    = None,
                  days              : Optional[List[str]] = None,
@@ -226,8 +230,8 @@ class BirdsEye:
 
         self.cfg = RunConfig(
             lot_size         = lot_size,
-            starting_cash    = starting_cash,
             margin_per_lot   = margin_per_lot,
+            max_lots         = max_lots,
             periods_per_year = periods_per_year
                                or PERIODS_PER_YEAR.get(index.upper(), 252),
         )
@@ -240,9 +244,6 @@ class BirdsEye:
         self.days              = days
         self.curve_every       = max(1, curve_every)
         self.collect_perseclog = collect_perseclog
-        # day selection comes from the manifest (train split, 0-dte), same as before:
-        # MANIFEST_PATH lists which dates are train; data_dir is where the raw files
-        # live. _paths() resolves the train dates to raw paths under data_dir.
         self.index             = index
         self.manifest_path     = env("MANIFEST_PATH")
         self.split             = "train"
@@ -278,19 +279,16 @@ class BirdsEye:
         log.info("run start | index=%s split=%s strategy=%s | %d day(s)",
                  self.index, self.split, self.strategy_cls.__name__, len(paths))
         jobs  = [(p, self.index, self.strategy_cls, self.strategy_kwargs, self.fields,
-                  self.cfg , self.cost_kwargs, self.curve_every, self.collect_perseclog)
+                  self.cfg, self.cost_kwargs, self.curve_every, self.collect_perseclog)
                  for p in paths]
 
         n = min(self.n_workers or (os.cpu_count() or 1), len(paths))
         if parallel and n > 1:
-            with ProcessPoolExecutor(max_workers=n) as ex:   # context manager — critical
+            with ProcessPoolExecutor(max_workers=n) as ex:
                 outs = list(ex.map(_run_one_day, jobs, chunksize=1))
         else:
             outs = [_run_one_day(j) for j in jobs]
 
-        # drop days that failed to load (skip sentinel: curve is None) so Results
-        # only ever holds usable days — the failed day's slot would otherwise be a
-        # None ledger/curve and break summary/stats. Log each skip with its error.
         good = [o for o in outs if o[1] is not None]
         for o in outs:
             if o[1] is None:
@@ -301,12 +299,12 @@ class BirdsEye:
             log.info("ran %d/%d day(s) (%d skipped)", len(good), len(outs), len(outs) - len(good))
 
         return Results(
-            days             = [o[0] for o in good],
-            curves           = {o[0]: o[1] for o in good},
-            tradelogs        = {o[0]: o[2] for o in good},
-            day_pnls         = [o[3] for o in good],
-            cfg              = self.cfg,
-            perseclogs       = {o[0]: o[4] for o in good},
-            traded_lots_list = [o[5] for o in good],
-            max_lots         = good[0][6],
+            days                 = [o[0] for o in good],
+            curves               = {o[0]: o[1] for o in good},
+            tradelogs            = {o[0]: o[2] for o in good},
+            day_pnls             = [o[3] for o in good],
+            cfg                  = self.cfg,
+            perseclogs           = {o[0]: o[4] for o in good},
+            traded_lots_list     = [o[5] for o in good],
+            exposure_curves_list = [o[6] for o in good],
         )

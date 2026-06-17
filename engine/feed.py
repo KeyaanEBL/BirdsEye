@@ -67,6 +67,10 @@ class Feed:
         # quote shortcuts (None if not requested)
         self.ce_bid, self.ce_ask = arrays.get(("ce", BID)), arrays.get(("ce", ASK))
         self.pe_bid, self.pe_ask = arrays.get(("pe", BID)), arrays.get(("pe", ASK))
+        self._ce_bid = self.ce_bid   # direct refs for quote() — no dict lookup per tick
+        self._ce_ask = self.ce_ask
+        self._pe_bid = self.pe_bid
+        self._pe_ask = self.pe_ask
 
     # ---- construction: raw /mnt via the Intern-Project pipeline (primary) ---
     @classmethod
