@@ -24,13 +24,14 @@ Parallelises a backtest over days, returns a Results object.
 
 import os
 import glob
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple, Type
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from .feed import Feed, DEFAULT_FIELDS
 from .costs import CostModel
@@ -40,6 +41,7 @@ from .broker import Broker
 from .env import env, get_manifest_files, get_data_dir
 from .logsetup import make_logger
 from . import analyzers, plots
+import cProfile, pstats, io
 
 # periods per year by underlying — override with periods_per_year kwarg if needed
 PERIODS_PER_YEAR: Dict[str, int] = {
@@ -66,11 +68,20 @@ def _run_one_day(args):
     (curve=None, last field = the error) instead of aborting the whole run."""
     (path, index, strategy_cls, strategy_kwargs, fields, cfg, cost_kwargs, curve_every, collect_perseclog) = args
 
+
+    # pr = cProfile.Profile()
+    # pr.enable()
+
     day = os.path.basename(path).split(".")[0]
     try:
         feed = Feed.from_raw(path, index, fields=fields)
     except Exception as e:
         return day, None, None, None, None, f"load error: {e}"
+
+    # pr.disable()
+    # s = io.StringIO()
+    # pstats.Stats(pr, stream=s).sort_stats('cumulative').print_stats(20)
+    # print(s.getvalue())
 
     pf    = Portfolio(lot_size=cfg.lot_size, max_lots=cfg.max_lots)
     cm    = CostModel(lot_size=cfg.lot_size, **cost_kwargs)
@@ -282,12 +293,31 @@ class BirdsEye:
                   self.cfg, self.cost_kwargs, self.curve_every, self.collect_perseclog)
                  for p in paths]
 
-        n = min(self.n_workers or (os.cpu_count() or 1), len(paths))
+        n = min(self.n_workers or len(paths), len(paths), os.cpu_count() or 1)
+
+        bar = tqdm(total=len(jobs), desc=f"{self.index} {self.strategy_cls.__name__}",
+                   unit="day", dynamic_ncols=True)
+
         if parallel and n > 1:
             with ProcessPoolExecutor(max_workers=n) as ex:
-                outs = list(ex.map(_run_one_day, jobs, chunksize=1))
+                futures = {ex.submit(_run_one_day, j): j for j in jobs}
+                outs = []
+                for fut in as_completed(futures):
+                    result = fut.result()
+                    outs.append(result)
+                    status = "skip" if result[1] is None else f"${result[3]:+,.0f}"
+                    bar.set_postfix_str(f"{result[0]} {status}")
+                    bar.update(1)
         else:
-            outs = [_run_one_day(j) for j in jobs]
+            outs = []
+            for j in jobs:
+                result = _run_one_day(j)
+                outs.append(result)
+                status = "skip" if result[1] is None else f"${result[3]:+,.0f}"
+                bar.set_postfix_str(f"{result[0]} {status}")
+                bar.update(1)
+
+        bar.close()
 
         good = [o for o in outs if o[1] is not None]
         for o in outs:

@@ -60,10 +60,15 @@ class StateMachineStrategy:
         self.broker     = broker                            # strategy owns its broker ref now
         self.name       = name or type(self).__name__
         self.context    = context or Context()
-        self._executing : Optional[Executing] = None        # Executing instance while an order works
-        self.perseclog    = PerSecLog()
-        self._guard_cache : dict = {}
+        self.perseclog  = PerSecLog()
         self.states[self.state].on_enter(self.context)
+        self._executing   : Optional[Executing] = None        # Executing instance while an order works
+        self._guard_cache : dict = {}
+        self._tcache    = {
+            name: (list(st.transitions.items()) if isinstance(st.transitions, dict)
+                else [(tr.guard, tr.dest) for tr in st.transitions])
+            for name, st in self.states.items()
+        }
 
     def next(self, snap):
         if snap.i < self.min_history:                       # warm-up
@@ -82,7 +87,7 @@ class StateMachineStrategy:
         alphas = self.compute_alphas(snap)
         self._log(snap, alphas)
 
-        for key, dest in self._transition_items(self.states[self.state]):
+        for key, dest in self._tcache[self.state]:
             guard, gname = self._resolve_guard(key)
             if guard(alphas, self.context):
                 self.states[self.state].on_exit(self.context)
@@ -132,7 +137,7 @@ class StateMachineStrategy:
     def _log(self, snap, alphas):
         row = {"timestamp": snap.ts, "spot": snap.spot, "atm": snap.atm, "state": self.state}
         if alphas:
-            row.update({k: v for k, v in alphas.items() if isinstance(v, (int, float))})
+            row.update(alphas)
         self.perseclog.add(**row)
 
     def describe(self) -> str:

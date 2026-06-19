@@ -11,7 +11,7 @@ fill, so equity = cash + realized + unrealized already nets all frictions.
 
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from .snapshot import MarketSnapshot
 
@@ -28,10 +28,11 @@ class Portfolio:
         self.max_lots     = max_lots
         self.cash         = 0.0
         self.realized_pnl = 0.0
-        self.positions    : Dict[Tuple[float, str], Position] = {}
-        self._active_keys  : set = set()
+        self.positions       : Dict[Tuple[float, str], Position] = {}
+        self._active_keys    : set = set()
         self._equity_values  : List[float] = []
         self._exposure_values: List[float] = []
+        self._leg_cache      : Dict[Tuple, Optional[Tuple]] = {}
 
     # ---- fills -------------------------------------------------------------
     def apply_fill(self, fill) -> None:
@@ -73,13 +74,25 @@ class Portfolio:
 
     # ---- marking -----------------------------------------------------------
     def unrealized_pnl(self, snap: MarketSnapshot) -> float:
+        if not self._active_keys:
+            return 0.0
         total = 0.0
+        feed  = snap._feed
+        i     = snap._i
         for key in self._active_keys:
+            if key not in self._leg_cache:
+                col   = feed.strike_to_col.get(key[0])
+                ot    = key[1].lower()
+                b_arr = feed._ce_bid if ot == 'ce' else feed._pe_bid
+                a_arr = feed._ce_ask if ot == 'ce' else feed._pe_ask
+                self._leg_cache[key] = (col, b_arr, a_arr) if col is not None and b_arr is not None else None
+            cached = self._leg_cache[key]
+            if cached is None: continue
+            col, b_arr, a_arr = cached
+            b, a = b_arr[i, col], a_arr[i, col]
+            if b != b or a != a: continue
             pos = self.positions[key]
-            mh  = snap.mid_and_half_spread(key[0], key[1])
-            if mh is None: continue
-            mid, _ = mh
-            total += (mid - pos.avg_entry) * pos.lots * self.lot_size
+            total += (0.5 * (b + a) - pos.avg_entry) * pos.lots * self.lot_size
         return total
 
     def equity(self, snap: MarketSnapshot) -> float:
