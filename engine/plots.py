@@ -24,20 +24,53 @@ def _plot_cum(ax, series, title, color):
 
 
 def plot_equity(summary, axes=None):
-    """Day-by-day cumulative P&L across the whole run, built from the per-day
-    summary table (Results.summary, or a Results). TWO SEPARATE plots, each with
-    its own drawdown shaded red: (1) net($) — after costs, (2) gross($) — mid-only,
-    no transaction/spread cost. Both cumulative-summed over days; x axis is days
-    (no tick labels)."""
+    """Cumulative P&L broken down by cost layer — 4 panels:
+      (1) gross        : mid-only, zero costs
+      (2) mid - txn    : gross minus transaction costs only
+      (3) mid - spread : gross minus spread costs only
+      (4) net          : gross minus all costs
+    Requires a Results object (not just the summary df) so it can
+    pull per-fill cost breakdown from the tradelog."""
+
     import matplotlib.pyplot as plt
-    df = summary.summary if hasattr(summary, "summary") else summary
-    net   = np.asarray(df["net($)"],   dtype=float).cumsum()
-    gross = np.asarray(df["gross($)"], dtype=float).cumsum()
+
+    if hasattr(summary, "summary"):
+        # Results object — pull both summary and tradelog
+        res = summary
+        df  = res.summary
+        tl  = res.tradelog   # cached_property, no ()
+
+        # aggregate spread and txn costs per day from tradelog
+        day_costs = (tl.groupby("day")[["spread_cost", "txn_cost"]]
+                       .sum()
+                       .rename(columns={"spread_cost": "spd($)",
+                                        "txn_cost":    "txn($)"}))
+        df = df.join(day_costs, how="left").fillna(0)
+    else:
+        # plain summary df — only combined costs available, can't split
+        raise ValueError(
+            "pass the Results object, not just summary — "
+            "need tradelog for per-fill cost breakdown"
+        )
+
+    gross  = np.asarray(df["gross($)"], dtype=float)
+    txn    = np.asarray(df["txn($)"],   dtype=float)
+    spread = np.asarray(df["spd($)"],   dtype=float)
+
+    curves = [
+        (gross.cumsum(),                     "mid-only (no costs)",        "tab:green"),
+        ((gross - txn).cumsum(),             "mid — txn costs only",       "tab:orange"),
+        ((gross - spread).cumsum(),          "mid — spread costs only",    "tab:purple"),
+        ((gross - txn - spread).cumsum(),    "net (all costs)",            "tab:blue"),
+    ]
+
     if axes is None:
-        _, axes = plt.subplots(2, 1, figsize=(11, 7))
-    _plot_cum(axes[0], net,   "net P&L (after costs)",   "tab:blue")
-    _plot_cum(axes[1], gross, "mid-only P&L (no costs)", "tab:green")
-    axes[1].set_xlabel("days")
+        _, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+
+    for ax, (curve, title, color) in zip(axes, curves):
+        _plot_cum(ax, curve, title, color)
+
+    axes[-1].set_xlabel("days")
     return axes
 
 
